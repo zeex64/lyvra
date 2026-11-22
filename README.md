@@ -34,6 +34,9 @@ Needs: CMake ≥ 3.20, a C++20 compiler, SDL3, the Vulkan loader, `glslc` (shade
 **FSR 4 (optional).** Build fsr4-vk from `third_party/fsr4-vk` by following its README. You need AMD's `amd_fidelityfx_upscaler_dx12.dll` from FidelityFX SDK 2.3.0; its setup verifies the hash and extracts the model, and the result is `build/linux/amd_fidelityfx_upscaler_vk.so`. Then either configure Lyvra with `-DLYVRA_FSR4_VK_LIB=/path/to/amd_fidelityfx_upscaler_vk.so` (copied next to the binary and installed to `lib/lyvra/`), or put the file in `~/.local/share/lyvra/`, or set `LYVRA_FSR4_LIB`. Without it, FSR 4 is greyed out.
 
 ```bash
+git clone https://github.com/zeex64/lyvra.git
+cd lyvra
+git submodule update --init --depth 1   # not --recursive: FSR 1's own sample submodules aren't needed
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 ninja -C build
 ./build/lyvra
