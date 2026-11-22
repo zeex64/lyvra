@@ -194,7 +194,7 @@ add_library(ffx_sdk STATIC
   ${FFX_VK_PATCHED}                                      # sdk/src/backends/vk/ffx_vk.cpp + alignment fix
   ${CMAKE_SOURCE_DIR}/cmake/ffx_vk_swapchain_stub.cpp)
 add_dependencies(ffx_sdk ffx_sdk_shaders)
-target_include_directories(ffx_sdk
+target_include_directories(ffx_sdk SYSTEM
   # cmake/ffx_include shadows FidelityFX/host/ffx_types.h (larger opaque context
   # size for 4-byte wchar_t); it must stay ahead of sdk/include for consumers too.
   PUBLIC  ${CMAKE_SOURCE_DIR}/cmake/ffx_include ${FFX_SDK_DIR}/include ${FFX_SHADER_OUT_DIR}

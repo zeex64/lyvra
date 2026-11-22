@@ -78,7 +78,9 @@ add_executable(lyvra
   src/main.cpp src/capture.cpp src/renderer.cpp src/ui.cpp src/audio.cpp
   src/settings.cpp src/fsr1_constants.cpp src/temporal.cpp src/framegen.cpp ${FONTS_CPP} ${ICON_CPP})
 add_dependencies(lyvra lyvra_shaders)
-target_include_directories(lyvra PRIVATE src ${SHADER_OUT_DIR} ${FSR1_DIR}
+target_include_directories(lyvra PRIVATE src ${SHADER_OUT_DIR})
+# Third-party headers as SYSTEM so their warnings don't drown ours.
+target_include_directories(lyvra SYSTEM PRIVATE ${FSR1_DIR}
   ${CMAKE_SOURCE_DIR}/third_party/ffx-api/api/include ${CMAKE_SOURCE_DIR}/third_party/ffx-api/upscalers/include)
 target_compile_options(lyvra PRIVATE -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers)
 target_link_libraries(lyvra PRIVATE ffx_sdk imgui PkgConfig::SDL3 vulkan_iface Threads::Threads ${CMAKE_DL_LIBS})
@@ -90,7 +92,7 @@ if(LYVRA_FSR4_VK_LIB)
   add_custom_command(TARGET lyvra POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different ${LYVRA_FSR4_VK_LIB} $<TARGET_FILE_DIR:lyvra>/amd_fidelityfx_upscaler_vk.so
     COMMENT "Copying fsr4-vk library")
-  install(FILES ${LYVRA_FSR4_VK_LIB} DESTINATION ${CMAKE_INSTALL_LIBDIR}/lyvra RENAME amd_fidelityfx_upscaler_vk.so)
+  install(FILES ${LYVRA_FSR4_VK_LIB} DESTINATION lib/lyvra RENAME amd_fidelityfx_upscaler_vk.so)  # app-private dir, found via ../lib/lyvra
 endif()
 
 include(GNUInstallDirs)

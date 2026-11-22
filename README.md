@@ -44,6 +44,19 @@ ninja -C build
 
 Your user must be in the `video` group to open `/dev/video*`.
 
+## Install
+
+`install.sh` checks dependencies, fetches submodules, builds and installs Lyvra with a launcher entry and icons:
+
+```bash
+./install.sh                         # for your user: ~/.local (no sudo)
+./install.sh --system                # for everyone: /usr/local (sudo)
+./install.sh --fsr4-lib /path/to/amd_fidelityfx_upscaler_vk.so   # also enable FSR 4
+./install.sh --uninstall             # remove it again (settings in ~/.config/lyvra are kept)
+```
+
+Re-run it after `git pull` to update. If the build directory was configured with `-DLYVRA_FSR4_VK_LIB`, the FSR 4 library is installed automatically.
+
 ### Options
 
 | Flag | |

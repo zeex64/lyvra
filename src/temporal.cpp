@@ -280,6 +280,7 @@ bool Temporal::init(VkInstance, VkPhysicalDevice phys, VkDevice device, std::str
     if (!ec) {
         candidates.push_back((exeDir / "amd_fidelityfx_upscaler_vk.so").string());
         candidates.push_back((exeDir / "../lib/lyvra/amd_fidelityfx_upscaler_vk.so").string());
+        candidates.push_back((exeDir / "../lib64/lyvra/amd_fidelityfx_upscaler_vk.so").string());
     }
     if (const char* h = getenv("HOME")) candidates.push_back(std::string(h) + "/.local/share/lyvra/amd_fidelityfx_upscaler_vk.so");
     fsr4Status = "fsr4-vk library (amd_fidelityfx_upscaler_vk.so) not found";
