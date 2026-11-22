@@ -36,7 +36,7 @@ void Settings::load() {
     auto b = [&](const char* k, bool& v) { if (kv.count(k)) v = kv[k] == "1"; };
     auto e = [&](const char* k, auto& v) { if (kv.count(k)) v = static_cast<std::remove_reference_t<decltype(v)>>(std::atoi(kv[k].c_str())); };
 
-    s("device", devicePath); u("fourcc", fourcc); u("width", width); u("height", height);
+    s("device", devicePath); s("device_name", deviceName); s("device_bus", deviceBus); u("fourcc", fourcc); u("width", width); u("height", height);
     u("fps_num", fpsNum); u("fps_den", fpsDen); e("matrix", matrix); e("range", range);
     e("upscaler", upscaler); fl("sharpness", sharpness); i("fsr_quality", fsrQuality); i("anime4k_variant", anime4kVariant); b("frame_gen", frameGen); b("fg_predict", fgPredict); i("fg_flow_scale", fgFlowScale);
     e("present", present); e("scale", scale); b("start_fullscreen", startFullscreen);
@@ -52,7 +52,7 @@ void Settings::save() const {
     std::ofstream f(path());
     if (!f) return;
     f << "# " APP_NAME " settings\n"
-      << "device=" << devicePath << "\nfourcc=" << fourcc << "\nwidth=" << width << "\nheight=" << height
+      << "device=" << devicePath << "\ndevice_name=" << deviceName << "\ndevice_bus=" << deviceBus << "\nfourcc=" << fourcc << "\nwidth=" << width << "\nheight=" << height
       << "\nfps_num=" << fpsNum << "\nfps_den=" << fpsDen << "\nmatrix=" << (int)matrix << "\nrange=" << (int)range
       << "\nupscaler=" << (int)upscaler << "\nsharpness=" << sharpness << "\nfsr_quality=" << fsrQuality << "\nanime4k_variant=" << anime4kVariant << "\nframe_gen=" << frameGen << "\nfg_predict=" << fgPredict << "\nfg_flow_scale=" << fgFlowScale
       << "\npresent=" << (int)present << "\nscale=" << (int)scale << "\nstart_fullscreen=" << startFullscreen

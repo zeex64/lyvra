@@ -13,8 +13,8 @@ enum class ColorMatrix : int { Auto = 0, BT709 = 1, BT601 = 2 };
 enum class ColorRange : int { Auto = 0, Limited = 1, Full = 2 };
 
 struct Settings {
-    // Source (0 = auto-pick)
-    std::string devicePath;
+    // Source (0 = auto-pick). Name and bus identify the card again if its /dev/videoN number changes.
+    std::string devicePath, deviceName, deviceBus;
     uint32_t fourcc = 0, width = 0, height = 0, fpsNum = 0, fpsDen = 0;
     ColorMatrix matrix = ColorMatrix::Auto;
     ColorRange range = ColorRange::Auto;

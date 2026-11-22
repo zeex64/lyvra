@@ -341,7 +341,7 @@ void topBar(float W, float y) {
 
     // Device button
     const DeviceInfo* dev = g->currentDevice();
-    std::string devName = g->capture.isOpen() ? g->capture.name : "No device";
+    std::string devName = g->capture.isOpen() ? g->capture.name : g->lost ? g->lostName : "No device";
     float bw = measure(F().regular, 13, devName.c_str()).x + 52;
     centerY(32);
     p = ImGui::GetCursorScreenPos();
@@ -350,7 +350,7 @@ void topBar(float W, float y) {
     if (hov) ImGui::SetTooltip("Change capture device (D)");
     dl->AddRectFilled(p, {p.x + bw, p.y + 32}, col(hov ? kBorder : kPanel2), 8);
     dl->AddRect(p, {p.x + bw, p.y + 32}, col(kBorder), 8);
-    dl->AddCircleFilled({p.x + 16, p.y + 16}, 4, col(g->signalOk() ? kAccent : (dev ? kWarn : kDim)));
+    dl->AddCircleFilled({p.x + 16, p.y + 16}, 4, col(g->signalOk() ? kAccent : (dev || g->lost ? kWarn : kDim)));
     text(dl, F().regular, 13, {p.x + 28, p.y + 8}, kText, devName.c_str());
     iconChevron(dl, {p.x + bw - 16, p.y + 16}, 12, col(kMuted));
     ImGui::SameLine(0, 14);
@@ -440,9 +440,11 @@ void bottomBar(float W, float y) {
     // Signal
     const char* sig;
     uint32_t sc;
-    if (!g->capture.isOpen()) { sig = "No device"; sc = kDim; }
+    std::string sigS;
+    if (g->lost) { sigS = "Disconnected — waiting for " + g->lostName; sig = sigS.c_str(); sc = kWarn; }
+    else if (!g->capture.isOpen()) { sig = "No device"; sc = kDim; }
     else if (g->signalOk()) { sig = "Receiving frames"; sc = kAccent; }
-    else { sig = "No frames — check the source"; sc = kWarn; }
+    else { sig = "No signal — check the source"; sc = kWarn; }
     dl->AddCircleFilled({p.x + 4, p.y + 10}, 4, col(sc));
     text(dl, F().regular, 12, {p.x + 14, p.y + 3}, kMuted, sig);
     p.x += 14 + measure(F().regular, 12, sig).x + 22;
@@ -495,7 +497,7 @@ void sparkline(ImDrawList* dl, ImVec2 p, ImVec2 sz, const Stats& s, int samples)
 }
 
 void hud(const Rect& v /* points */) {
-    if (!g->settings.showHud || !g->capture.isOpen()) return;
+    if (!g->settings.showHud || !g->capture.isOpen() || g->noSignalSec() >= 1.5f) return;
     const float w = 272, m = 16;
     int c = g->settings.hudCorner;
     ImVec2 pos{c % 2 ? v.x + v.w - w - m : v.x + m, c >= 2 ? v.y + v.h - m : v.y + m};
@@ -1101,7 +1103,9 @@ void statsWindow() {
         std::string usb = usbSpeedFor(c.path);
         double mbs = c.usbMBps();
         std::string rows[][2] = {
-            {"Device", c.isOpen() ? c.name + " · " + c.path : "none"},
+            {"Device", c.isOpen() ? c.name + " · " + c.path : g->lost ? g->lostName + " · disconnected" : "none"},
+            {"Signal", !c.isOpen() ? std::string("--") : g->signalOk() ? fmt("receiving%s", g->streamRestarts ? fmt(" · %llu stream restart%s", (unsigned long long)g->streamRestarts, g->streamRestarts == 1 ? "" : "s").c_str() : "")
+                                                    : fmt("none for %.0f s · %llu stream restart%s", g->noSignalSec(), (unsigned long long)g->streamRestarts, g->streamRestarts == 1 ? "" : "s")},
             {"Input", c.isOpen() ? fmt("%s @ %.0f · %s", res(c.width, c.height).c_str(), c.fps, fourccName(c.fourcc)) : "--"},
             {"Colour", fmt("%s %s", (g->settings.matrix == ColorMatrix::BT601 || (g->settings.matrix == ColorMatrix::Auto && c.height < 720)) ? "BT.601" : "BT.709",
                            g->settings.range == ColorRange::Full ? "full" : "limited")},
@@ -1208,7 +1212,7 @@ void picker() {
         dl->AddRectFilled(p, {p.x + w, p.y + 90}, col(kPanel), 12);
         dl->AddRect(p, {p.x + w, p.y + 90}, col(kBorder), 12);
         text(dl, F().semibold, 15, {p.x + 24, p.y + 24}, kText, "No video capture devices found");
-        text(dl, F().regular, 13, {p.x + 24, p.y + 50}, kMuted, "Plug in your capture card and press Refresh. You need to be in the \"video\" group.");
+        text(dl, F().regular, 13, {p.x + 24, p.y + 50}, kMuted, "Plug in your capture card: it appears here by itself. You need to be in the \"video\" group.");
     } else {
         g->pickerSelection = std::clamp(g->pickerSelection, 0, int(g->devices.size()) - 1);
         for (int i = 0; i < int(g->devices.size()); i++) {
@@ -1252,10 +1256,11 @@ void picker() {
         textColored(F().regular, 12, kWarn, err.c_str());
         ImGui::SameLine();
     }
-    float bwTotal = 110 + 10 + (g->capture.isOpen() ? 100 + 10 : 0) + 150;
+    bool canCancel = g->capture.isOpen() || g->lost;
+    float bwTotal = 110 + 10 + (canCancel ? 100 + 10 : 0) + 150;
     ImGui::SetCursorPosX(bx + w - bwTotal);
     if (secondaryButton("Refresh", {110, 44})) g->refreshDevices();
-    if (g->capture.isOpen()) {
+    if (canCancel) {
         ImGui::SameLine(0, 10);
         if (secondaryButton("Cancel", {100, 44})) g->showPicker = false;
     }
@@ -1294,14 +1299,48 @@ void toast() {
 }
 
 void emptyState(const Rect& v) {
-    if (g->capture.isOpen() && g->renderer.hasInput()) return;
     if (g->showPicker) return;
+    bool open = g->capture.isOpen();
+    // Longer than signalOk()'s 0.5 s so a hiccup doesn't flash it; a freshly opened card gets 4 s for its first frame.
+    bool noSignal = open && g->noSignalSec() >= (g->capture.lastFrameNs.load() ? 1.5f : 4.0f);
+    if (open && g->renderer.hasInput() && !noSignal) return;
     ImDrawList* dl = ImGui::GetBackgroundDrawList();
     ImVec2 c{v.x + v.w / 2, v.y + v.h / 2};
-    iconScreen(dl, {c.x, c.y - 24}, 44, col(0x4A515C), 1.5f);
-    const char* t = !g->capture.isOpen() ? "No capture device open" : "Waiting for the first frame…";
-    ImVec2 ts = measure(F().regular, 14, t);
-    text(dl, F().regular, 14, {c.x - ts.x / 2, c.y + 8}, kDim, t);
+    if (noSignal && g->renderer.hasInput()) dl->AddRectFilled({v.x, v.y}, {v.x + v.w, v.y + v.h}, col(kVideoBg, 0.8f));  // dim the stale frame
+
+    std::string title, sub;
+    bool warn = false;
+    if (g->lost) {
+        title = g->lostName + " disconnected";
+        sub = "It reconnects automatically when it's plugged back in.";
+        warn = true;
+    } else if (!open) {
+        title = "No capture device open";
+    } else if (noSignal) {
+        title = "No signal";
+        sub = g->capture.name + " is connected but isn't sending frames. Check that the source is on and the cable is seated.";
+        if (g->streamRestarts) sub += fmt(" The stream was restarted %llu time%s.", (unsigned long long)g->streamRestarts, g->streamRestarts == 1 ? "" : "s");
+        warn = true;
+    } else {
+        title = "Waiting for the first frame…";
+    }
+    if (warn) iconWarn(dl, {c.x, c.y - 24}, 40, col(kWarn, 0.85f));
+    else iconScreen(dl, {c.x, c.y - 24}, 44, col(0x4A515C), 1.5f);
+    ImVec2 ts = measure(F().semibold, 15, title.c_str());
+    text(dl, F().semibold, 15, {c.x - ts.x / 2, c.y + 8}, warn ? kText : kDim, title.c_str());
+    if (!sub.empty()) {
+        float wrap = std::min(520.f, v.w - 64);
+        ImFont* f = F().regular;
+        ImVec2 ss = f->CalcTextSizeA(13, FLT_MAX, wrap, sub.c_str());
+        text(dl, f, 13, {c.x - std::min(ss.x, wrap) / 2, c.y + 34}, kMuted, sub.c_str(), wrap);
+    }
+    if (g->lost) {
+        ImGui::SetNextWindowPos({c.x, c.y + 78}, 0, {0.5f, 0});
+        ImGui::Begin("##lost", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings |
+                                            ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoFocusOnAppearing);
+        if (secondaryButton("Choose another device", {210, 40})) g->showPicker = true;
+        ImGui::End();
+    }
 }
 
 void shortcuts() {
@@ -1343,7 +1382,7 @@ void shortcuts() {
         g->showToast(g->compareView ? std::string("Split view: FSR 1 | ") + upscalerName(g->settings.upscaler) : std::string("Split view off"));
     }
     if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
-        if (g->showPicker && g->capture.isOpen()) g->showPicker = false;
+        if (g->showPicker && (g->capture.isOpen() || g->lost)) g->showPicker = false;
         else if (g->showSettings) { g->showSettings = false; g->settings.save(); }
         else if (g->showStats) g->showStats = false;
         else if (g->fullscreen) g->toggleFullscreen();

@@ -18,8 +18,16 @@
 #include "imgui_impl_sdl3.h"
 #include "ui.h"
 
-static Uint32 gFrameEvent = 0;
-static std::atomic<bool> gFrameEventPending{false};
+static Uint32 gFrameEvent = 0, gDeviceEvent = 0;
+static std::atomic<bool> gFrameEventPending{false}, gDeviceEventPending{false};
+
+// The same card again after re-enumeration: by USB port (bus), then by name, then by node path.
+static const DeviceInfo* findDevice(const std::vector<DeviceInfo>& devices, const std::string& bus, const std::string& name, const std::string& path) {
+    for (auto& d : devices) if (!bus.empty() && d.bus == bus) return &d;
+    for (auto& d : devices) if (!name.empty() && d.name == name) return &d;
+    for (auto& d : devices) if (!path.empty() && d.path == path) return &d;
+    return nullptr;
+}
 
 // ---- App actions ------------------------------------------------------------
 void App::refreshDevices() {
@@ -38,6 +46,80 @@ const DeviceInfo* App::currentDevice() const {
 bool App::signalOk() const {
     uint64_t last = capture.lastFrameNs.load();
     return capture.isOpen() && last && nowNs() - last < 500'000'000ull;
+}
+
+float App::noSignalSec() const {
+    if (!capture.isOpen()) return 0;
+    uint64_t last = capture.lastFrameNs.load();
+    uint64_t ref = last ? last : captureStartedNs;
+    uint64_t now = nowNs();
+    return ref && now > ref ? float(double(now - ref) / 1e9) : 0.f;
+}
+
+void App::scheduleDeviceCheck(uint64_t delayNs) {
+    uint64_t due = nowNs() + delayNs;
+    if (!nextDeviceCheckNs || due < nextDeviceCheckNs) nextDeviceCheckNs = due;
+}
+
+void App::onCaptureLost() {
+    const DeviceInfo* d = currentDevice();
+    lost = true;
+    lostName = capture.name;
+    lostBus = d ? d->bus : settings.deviceBus;
+    lostPath = capture.path;
+    lostReason = capture.failReason;
+    lostMode = activeMode;
+    lostModeExplicit = settings.width != 0;
+    fprintf(stderr, "capture: %s lost (%s); waiting for it to come back\n", lostName.c_str(), lostReason.c_str());
+    closeDevice();
+    refreshDevices();
+    stats.reset();  // the video area says what happened; stale latency numbers would only confuse
+    scheduleDeviceCheck(1'000'000'000ull);  // a driver hiccup rather than an unplug: the node is still there
+}
+
+void App::onDevicesChanged() {
+    std::vector<std::string> before;
+    for (auto& d : devices) before.push_back(d.path);
+    refreshDevices();
+    fprintf(stderr, "hotplug: re-enumerated, %zu capture device%s\n", devices.size(), devices.size() == 1 ? "" : "s");
+    auto isNew = [&](const DeviceInfo& d) { return std::find(before.begin(), before.end(), d.path) == before.end(); };
+
+    if (lost) {
+        if (const DeviceInfo* d = findDevice(devices, lostBus, lostName, lostPath)) {
+            if (openDevice(d->path, lostModeExplicit ? &lostMode : nullptr)) {
+                fprintf(stderr, "capture: reconnected to %s (%s)\n", capture.name.c_str(), capture.path.c_str());
+                showToast("Reconnected: " + capture.name + " · " + activeMode.label());
+                return;
+            }
+        }
+        scheduleDeviceCheck(5'000'000'000ull);  // keep looking; also retries a node udev hasn't made readable yet
+        return;
+    }
+    if (!capture.isOpen() && !testPattern) {
+        // Nothing open (the picker is up): the remembered card was just plugged in, so start it.
+        const DeviceInfo* d = findDevice(devices, settings.deviceBus, settings.deviceName, settings.devicePath);
+        if (d && isNew(*d) && openDevice(d->path, nullptr)) { showPicker = false; return; }
+    }
+    for (auto& d : devices) if (isNew(d)) showToast(d.name + " connected");
+}
+
+void App::restartCapture() {
+    if (!capture.isOpen()) return;
+    std::string path = capture.path;
+    VideoMode mode = activeMode;
+    streamRestarts++;
+    fprintf(stderr, "capture: no frames for %.0f s, restarting the stream\n", noSignalSec());
+    uint64_t last = capture.lastFrameNs.load();
+    uint64_t since = last ? last : captureStartedNs;  // keep counting from the last frame, not from this restart
+    capture.close();
+    std::string err;
+    if (!capture.open(path, mode, err)) {
+        capture.failReason = err;
+        capture.failed = true;
+        onCaptureLost();
+        return;
+    }
+    captureStartedNs = since;
 }
 
 void App::showToast(const std::string& msg) {
@@ -67,6 +149,11 @@ bool App::openDevice(const std::string& path, const VideoMode* requested) {
     }
     activeMode = {capture.fourcc, capture.width, capture.height, mode.fpsNum, mode.fpsDen};
     settings.devicePath = path;
+    settings.deviceName = dev->name;
+    settings.deviceBus = dev->bus;
+    lost = false;
+    captureStartedNs = nowNs();
+    nextStreamRestartNs = 0;
     if (requested) {
         settings.fourcc = mode.fourcc;
         settings.width = mode.width;
@@ -115,6 +202,7 @@ int main(int argc, char** argv) {
         return 1;
     }
     gFrameEvent = SDL_RegisterEvents(1);
+    gDeviceEvent = SDL_RegisterEvents(1);
 
     static App app;  // static: lives past main's locals, joined/destroyed in order below
     app.settings.load();
@@ -132,6 +220,7 @@ int main(int argc, char** argv) {
     bool cliFullscreen = false;
     bool noJitter = false, noFgLock = false;
     int testPattern = 0;  // synthetic frames with known motion: 1 = blocks, 2 = smooth
+    int testUnplugSec = 0;  // --test-unplug N: pretend the device vanished N seconds in (exercises reconnect)
     std::string screenshotPath, showPanel, shotOnGenerated;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--device") && i + 1 < argc) app.settings.devicePath = argv[++i];
@@ -172,6 +261,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--test-pattern")) testPattern = 1;
         else if (!strcmp(argv[i], "--test-pattern=smooth")) testPattern = 2;
         else if (!strcmp(argv[i], "--test-pattern=fast")) testPattern = 3;
+        else if (!strcmp(argv[i], "--test-unplug") && i + 1 < argc) testUnplugSec = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--help")) {
             printf("Usage: %s [--device /dev/videoN] [--fullscreen] [--selftest SECONDS]\n", argv[0]);
             return 0;
@@ -215,11 +305,22 @@ int main(int argc, char** argv) {
         }
     });
 
+    // Hotplug: /dev changes wake the main loop, which re-enumerates after a short delay.
+    app.deviceMonitor.start([] {
+        if (!gDeviceEventPending.exchange(true)) {
+            SDL_Event e{};
+            e.type = gDeviceEvent;
+            SDL_PushEvent(&e);
+        }
+    }, getenv("LYVRA_DEV_DIR") ? getenv("LYVRA_DEV_DIR") : "/dev");  // LYVRA_DEV_DIR: watch another directory (testing)
+    if (!app.deviceMonitor.active()) fprintf(stderr, "hotplug: inotify on /dev unavailable, devices are only refreshed on demand\n");
+
+    app.testPattern = testPattern != 0;
     app.refreshDevices();
     bool opened = false;
     if (!app.settings.devicePath.empty() && !testPattern)
-        for (auto& d : app.devices)
-            if (d.path == app.settings.devicePath) opened = app.openDevice(d.path, nullptr);
+        if (const DeviceInfo* d = findDevice(app.devices, app.settings.deviceBus, app.settings.deviceName, app.settings.devicePath))
+            opened = app.openDevice(d->path, nullptr);
     if (!opened && !testPattern) app.showPicker = true;
     std::vector<uint8_t> testFrame(1920 * 1080 * 3 / 2);
     uint64_t testFrameIdx = 0, lastTestNs = 0;
@@ -257,6 +358,9 @@ int main(int argc, char** argv) {
         while (got) {
             if (e.type == gFrameEvent) {
                 gFrameEventPending = false;
+            } else if (e.type == gDeviceEvent) {
+                gDeviceEventPending = false;
+                app.scheduleDeviceCheck(400'000'000ull);  // let udev finish setting the node's group
             } else {
                 ImGui_ImplSDL3_ProcessEvent(&e);
                 uiEvent = true;
@@ -269,6 +373,8 @@ int main(int argc, char** argv) {
                     case SDL_EVENT_AUDIO_DEVICE_REMOVED:
                         app.audioInputs = AudioPassthrough::inputs();
                         app.audioOutputs = AudioPassthrough::outputs();
+                        // A card's audio interface can show up after its video node: pair it once it's there.
+                        if (e.type == SDL_EVENT_AUDIO_DEVICE_ADDED && app.capture.isOpen() && app.settings.audioEnabled && !app.audio.active()) app.restartAudio();
                         break;
                     default: break;
                 }
@@ -278,12 +384,26 @@ int main(int argc, char** argv) {
         uint64_t now = nowNs();
         if (uiEvent) app.lastInputNs = now;
 
-        // Device failure (unplugged, etc.)
-        if (app.capture.failed && app.capture.isOpen()) {
-            app.showToast(app.capture.failReason);
-            app.closeDevice();
-            app.refreshDevices();
-            app.showPicker = true;
+        // Device failure (unplugged, etc.): wait for the same card to come back.
+        if (testUnplugSec > 0 && app.capture.isOpen() && now - startNs >= uint64_t(testUnplugSec) * 1'000'000'000ull) {
+            testUnplugSec = 0;
+            app.capture.failReason = "Device disconnected (simulated)";
+            app.capture.failed = true;
+        }
+        if (app.capture.failed && app.capture.isOpen()) app.onCaptureLost();
+        if (app.nextDeviceCheckNs && now >= app.nextDeviceCheckNs) {
+            app.nextDeviceCheckNs = 0;
+            app.onDevicesChanged();
+        }
+        // Signal recovery: a card that stops delivering frames (source off, resolution change) may
+        // not resume on its own, so restart the stream every few seconds until frames arrive.
+        if (app.capture.isOpen() && !testPattern) {
+            if (app.noSignalSec() >= 4.0f) {
+                if (now >= app.nextStreamRestartNs) {
+                    app.restartCapture();
+                    app.nextStreamRestartNs = nowNs() + 5'000'000'000ull;
+                }
+            } else app.nextStreamRestartNs = 0;
         }
 
         // Apply live settings
@@ -503,8 +623,9 @@ int main(int argc, char** argv) {
             lastReportNs = now;
             auto& r = app.renderer;
             auto& s = app.stats;
-            printf("[selftest] cap %.1f fps | shown %.1f fps | latency avg %.2f p99 %.2f min %.2f ms | xfer %.2f dec %.2f wait %.2f cpu %.2f | "
+            printf("[selftest] %s | cap %.1f fps | shown %.1f fps | latency avg %.2f p99 %.2f min %.2f ms | xfer %.2f dec %.2f wait %.2f cpu %.2f | "
                    "gpu conv %.3f up %.3f comp %.3f | %ux%u %s -> %ux%u %s | dropped %llu+%llu | audio %s %.1f ms | gen %.1f fps\n",
+                   app.lost ? "DISCONNECTED" : !app.capture.isOpen() ? "no device" : app.signalOk() ? "signal" : "NO SIGNAL",
                    app.capture.measuredFps.load(), s.shownFps, s.latAvg, s.latP99, s.latMin, s.transfer, s.decode, s.wait, s.cpu,
                    s.gpuConvert, s.gpuUpscale, s.gpuComposite, app.capture.width, app.capture.height, fourccName(app.capture.fourcc),
                    r.outW, r.outH, r.effectiveUpscaler == Upscaler::FSR4 ? "FSR4" : r.effectiveUpscaler == Upscaler::FSR3 ? "FSR3" : r.effectiveUpscaler == Upscaler::FSR1 ? "FSR1"
@@ -536,6 +657,7 @@ int main(int argc, char** argv) {
     if (cliSharpness) app.settings.sharpness = savedSharpness;
     if (cliA4k) app.settings.anime4kVariant = savedA4k;
     app.settings.save();
+    app.deviceMonitor.stop();
     app.capture.close();
     app.audio.stop();
     app.renderer.shutdown();

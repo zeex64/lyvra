@@ -3,6 +3,7 @@
 #include <linux/videodev2.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <sys/inotify.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -193,6 +194,44 @@ std::vector<DeviceInfo> enumerateDevices() {
     }
     std::stable_sort(out.begin(), out.end(), [](auto& a, auto& b) { return a.isCaptureCard > b.isCaptureCard; });
     return out;
+}
+
+bool DeviceMonitor::start(std::function<void()> cb, const std::string& dir) {
+    stop();
+    fd_ = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+    if (fd_ < 0) return false;
+    if (inotify_add_watch(fd_, dir.c_str(), IN_CREATE | IN_DELETE | IN_ATTRIB | IN_MOVED_TO) < 0) {
+        ::close(fd_);
+        fd_ = -1;
+        return false;
+    }
+    cb_ = std::move(cb);
+    stop_ = false;
+    thread_ = std::thread(&DeviceMonitor::run, this);
+    return true;
+}
+
+void DeviceMonitor::stop() {
+    stop_ = true;
+    if (thread_.joinable()) thread_.join();
+    if (fd_ >= 0) { ::close(fd_); fd_ = -1; }
+}
+
+void DeviceMonitor::run() {
+    alignas(inotify_event) char buf[16 * 1024];
+    while (!stop_) {
+        pollfd p{fd_, POLLIN, 0};
+        if (poll(&p, 1, 200) <= 0) continue;
+        ssize_t n = read(fd_, buf, sizeof buf);
+        if (n <= 0) continue;
+        bool video = false;
+        for (ssize_t off = 0; off < n;) {
+            auto* ev = reinterpret_cast<const inotify_event*>(buf + off);
+            if (ev->len && strncmp(ev->name, "video", 5) == 0) video = true;
+            off += sizeof(inotify_event) + ev->len;
+        }
+        if (video && cb_) cb_();
+    }
 }
 
 bool Capture::open(const std::string& devPath, const VideoMode& mode, std::string& err) {

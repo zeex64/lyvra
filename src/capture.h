@@ -32,6 +32,25 @@ double fourccBytesPerPixel(uint32_t fourcc);
 VideoMode pickBestMode(const std::vector<VideoMode>& modes);
 std::string usbSpeedFor(const std::string& devPath);  // e.g. "5 Gbps", empty if unknown
 
+// Watches a directory (normally /dev) for video nodes appearing, disappearing or changing
+// permissions, and calls `cb` from a background thread each time. The callback should only
+// signal the main loop; enumerate there, after a short delay, since udev sets the node's group
+// a moment after creating it.
+class DeviceMonitor {
+public:
+    ~DeviceMonitor() { stop(); }
+    bool start(std::function<void()> cb, const std::string& dir = "/dev");
+    void stop();
+    bool active() const { return fd_ >= 0; }
+
+private:
+    void run();
+    int fd_ = -1;
+    std::thread thread_;
+    std::atomic<bool> stop_{false};
+    std::function<void()> cb_;
+};
+
 struct CaptureFrame {
     int index = -1;  // V4L2 buffer index, or decode slot for MJPEG
     const uint8_t* data = nullptr;

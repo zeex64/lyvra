@@ -61,6 +61,7 @@ struct App {
     SDL_Window* window = nullptr;
     Settings settings;
     Capture capture;
+    DeviceMonitor deviceMonitor;
     Renderer renderer;
     AudioPassthrough audio;
     std::vector<DeviceInfo> devices;
@@ -84,6 +85,18 @@ struct App {
     uint64_t toastUntilNs = 0;
     std::string audioError;
 
+    // Hotplug / reconnect. `lost` is set when the device vanished while viewing; the app then waits
+    // for it to come back (matched by USB bus, then name, then path) instead of opening the picker.
+    bool lost = false;
+    std::string lostName, lostBus, lostPath, lostReason;
+    VideoMode lostMode;
+    bool lostModeExplicit = false;
+    uint64_t nextDeviceCheckNs = 0;   // when to re-enumerate next (hotplug event or periodic retry while lost)
+    uint64_t captureStartedNs = 0;    // last (re)start of the stream
+    uint64_t nextStreamRestartNs = 0; // signal recovery: stream off/on while no frames arrive
+    uint64_t streamRestarts = 0;
+    bool testPattern = false;
+
     Rect videoAreaPx;      // where the video may be drawn, in pixels
     float pxPerPoint = 1;  // framebuffer scale
 
@@ -96,4 +109,9 @@ struct App {
     void showToast(const std::string& msg);
     const DeviceInfo* currentDevice() const;
     bool signalOk() const;
+    float noSignalSec() const;   // seconds since the last frame (0 while frames arrive or nothing is open)
+    void onCaptureLost();        // capture thread reported an error: remember the device, wait for it
+    void onDevicesChanged();     // re-enumerate; reconnect a lost device or auto-start the remembered one
+    void restartCapture();       // stream off/on on the current device (no-signal recovery)
+    void scheduleDeviceCheck(uint64_t delayNs);
 };
