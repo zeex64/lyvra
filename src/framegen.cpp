@@ -4,6 +4,8 @@
 #include <FidelityFX/host/ffx_frameinterpolation.h>
 #include <FidelityFX/host/ffx_opticalflow.h>
 
+#include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <vector>
 
@@ -12,6 +14,9 @@ static const uint32_t kFgMotionSpv[] =
     ;
 static const uint32_t kFgLockSpv[] =
 #include "fglock.comp.inc"
+    ;
+static const uint32_t kFgPredMvSpv[] =
+#include "fgpredmv.comp.inc"
     ;
 static const uint32_t kFgCheckSpv[] =
 #include "fgcheck.comp.inc"
@@ -39,12 +44,19 @@ struct FrameGen::Impl {
     FfxFrameInterpolationContext fi{};
     bool ofLive = false, fiLive = false;
     uint32_t w = 0, h = 0, blockSize = 8;
-    uint32_t flowScale = 1, ofW = 0, ofH = 0;  // optical flow runs at 1/flowScale resolution
+    uint32_t ofW = 0, ofH = 0;  // optical flow resolution
+    int flowPercent = -1;
     Img small;
     VkPipeline downPipe = VK_NULL_HANDLE;
     VkSampler linearDown = VK_NULL_HANDLE;
     uint64_t frameID = 0;
-    Img flow, scd, motion, depth, dilDepth, dilMotion, prevDepth, output;
+    Img flow, scd, motion, depth, dilDepth, dilMotion, prevDepth, output, predMv;
+    Img mvHist[2];  // predict mode: raw motion of the last frames (ping-pong)
+    int histIdx = 0;
+    bool haveHist = false;
+    VkDescriptorSetLayout pSetLayout = VK_NULL_HANDLE;
+    VkPipelineLayout pLayout = VK_NULL_HANDLE;
+    VkPipeline pPipe = VK_NULL_HANDLE;
     Img prevFinal[2];
     int prevIdx = 0;
     bool havePrev = false;
@@ -111,7 +123,7 @@ struct FrameGen::Impl {
         if (fiLive) ffxFrameInterpolationContextDestroy(&fi);
         if (ofLive) ffxOpticalflowContextDestroy(&of);
         fiLive = ofLive = false;
-        for (Img* i : {&flow, &scd, &motion, &depth, &dilDepth, &dilMotion, &prevDepth, &output, &prevFinal[0], &prevFinal[1], &small}) destroy(*i);
+        for (Img* i : {&flow, &scd, &motion, &depth, &dilDepth, &dilMotion, &prevDepth, &output, &prevFinal[0], &prevFinal[1], &small, &predMv, &mvHist[0], &mvHist[1]}) destroy(*i);
         w = h = 0;
         havePrev = false;
     }
@@ -162,7 +174,7 @@ bool FrameGen::init(VkPhysicalDevice phys, VkDevice device, std::string& err) {
     lci.bindingCount = 2;
     lci.pBindings = b;
     vkCreateDescriptorSetLayout(device, &lci, nullptr, &d_->setLayout);
-    VkPushConstantRange pcr{VK_SHADER_STAGE_COMPUTE_BIT, 0, 16};
+    VkPushConstantRange pcr{VK_SHADER_STAGE_COMPUTE_BIT, 0, 20};
     VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     pli.setLayoutCount = 1;
     pli.pSetLayouts = &d_->setLayout;
@@ -213,6 +225,31 @@ bool FrameGen::init(VkPhysicalDevice phys, VkDevice device, std::string& err) {
     r = vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &cpi, nullptr, &d_->lPipe);
     vkDestroyShaderModule(device, sm, nullptr);
     if (r != VK_SUCCESS) { err = "frame generation lock pipeline creation failed"; return false; }
+
+    // Predict-mode motion pipeline: cur, prev, motion -> predicted motion + stored frame
+    VkDescriptorSetLayoutBinding pb[7] = {
+        {0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+        {1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+        {2, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+        {3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+        {4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+        {5, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+        {6, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}};
+    lci.bindingCount = 7;
+    lci.pBindings = pb;
+    vkCreateDescriptorSetLayout(device, &lci, nullptr, &d_->pSetLayout);
+    pli.pSetLayouts = &d_->pSetLayout;
+    VkPushConstantRange ppcr{VK_SHADER_STAGE_COMPUTE_BIT, 0, 24};
+    pli.pPushConstantRanges = &ppcr;
+    vkCreatePipelineLayout(device, &pli, nullptr, &d_->pLayout);
+    smi.codeSize = sizeof kFgPredMvSpv;
+    smi.pCode = kFgPredMvSpv;
+    vkCreateShaderModule(device, &smi, nullptr, &sm);
+    cpi.stage.module = sm;
+    cpi.layout = d_->pLayout;
+    r = vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &cpi, nullptr, &d_->pPipe);
+    vkDestroyShaderModule(device, sm, nullptr);
+    if (r != VK_SUCCESS) { err = "frame generation predict pipeline creation failed"; return false; }
 
     // Fast-motion guard pipeline
     VkDescriptorSetLayoutBinding cb[4] = {
@@ -266,6 +303,9 @@ void FrameGen::shutdown() {
     if (d_->setLayout) vkDestroyDescriptorSetLayout(d_->dev, d_->setLayout, nullptr);
     if (d_->nearest) vkDestroySampler(d_->dev, d_->nearest, nullptr);
     if (d_->lPipe) vkDestroyPipeline(d_->dev, d_->lPipe, nullptr);
+    if (d_->pPipe) vkDestroyPipeline(d_->dev, d_->pPipe, nullptr);
+    if (d_->pLayout) vkDestroyPipelineLayout(d_->dev, d_->pLayout, nullptr);
+    if (d_->pSetLayout) vkDestroyDescriptorSetLayout(d_->dev, d_->pSetLayout, nullptr);
     if (d_->cPipe) vkDestroyPipeline(d_->dev, d_->cPipe, nullptr);
     if (d_->cLayout) vkDestroyPipelineLayout(d_->dev, d_->cLayout, nullptr);
     if (d_->cSetLayout) vkDestroyDescriptorSetLayout(d_->dev, d_->cSetLayout, nullptr);
@@ -279,17 +319,17 @@ void FrameGen::shutdown() {
     ready_ = false;
 }
 
-bool FrameGen::ensure(uint32_t w, uint32_t h, std::string& err) {
+bool FrameGen::ensure(uint32_t w, uint32_t h, int flowPercent, std::string& err) {
     if (!ready_) { err = "FidelityFX not initialised"; return false; }
     Impl& d = *d_;
-    if (d.ofLive && d.fiLive && d.w == w && d.h == h) return true;
+    if (d.ofLive && d.fiLive && d.w == w && d.h == h && d.flowPercent == flowPercent) return true;
     vkDeviceWaitIdle(d.dev);
     d.destroyContexts();
 
-    // Optical flow at half resolution for large outputs (most of the cost at 4K); interpolation stays full-res.
-    d.flowScale = w > 2560 ? 2 : 1;
-    d.ofW = w / d.flowScale;
-    d.ofH = h / d.flowScale;
+    // Optical flow can run on a smaller copy of the frame ("flow scale"); interpolation stays full-res.
+    const int pct = flowPercent > 0 ? std::clamp(flowPercent, 10, 100) : (w > 2560 ? 50 : 100);
+    d.ofW = pct == 100 ? w : std::max(64u, (uint32_t(std::lround(w * pct / 100.0)) + 1) & ~1u);
+    d.ofH = pct == 100 ? h : std::max(36u, (uint32_t(std::lround(h * pct / 100.0)) + 1) & ~1u);
     FfxOpticalflowContextDescription od{};
     od.backendInterface = d.iface;
     od.resolution = {d.ofW, d.ofH};
@@ -332,13 +372,19 @@ bool FrameGen::ensure(uint32_t w, uint32_t h, std::string& err) {
               d.create(d.dilMotion, dmw, dmh, VK_FORMAT_R16G16_SFLOAT, rw) &&
               d.create(d.prevDepth, pdw, pdh, VK_FORMAT_R32_UINT, rw) &&
               d.create(d.output, w, h, VK_FORMAT_R8G8B8A8_UNORM, rw) &&
-              (d.flowScale == 1 || d.create(d.small, d.ofW, d.ofH, VK_FORMAT_R8G8B8A8_UNORM, rw)) &&
+              (d.ofW == w || d.create(d.small, d.ofW, d.ofH, VK_FORMAT_R8G8B8A8_UNORM, rw)) &&
+              d.create(d.predMv, w, h, VK_FORMAT_R16G16_SFLOAT, rw) &&
+              d.create(d.mvHist[0], w, h, VK_FORMAT_R16G16_SFLOAT, rw) &&
+              d.create(d.mvHist[1], w, h, VK_FORMAT_R16G16_SFLOAT, rw) &&
               d.create(d.prevFinal[0], w, h, VK_FORMAT_R8G8B8A8_UNORM, rw) &&
               d.create(d.prevFinal[1], w, h, VK_FORMAT_R8G8B8A8_UNORM, rw);
     if (!ok) { err = "frame generation resource allocation failed"; d.destroyContexts(); return false; }
     d.w = w;
     d.h = h;
+    d.flowPercent = flowPercent;
     d.frameID = 0;
+    d.havePrev = false;
+    d.haveHist = false;
     return true;
 }
 
@@ -360,9 +406,9 @@ bool FrameGen::record(VkCommandBuffer cmd, const FrameGenParams& p) {
     FfxResource color = ffxGetResourceVK((void*)p.color, ffxGetImageResourceDescriptionVK(p.color, p.colorInfo), L"PG_FgColor",
                                          p.colorInGeneral ? FFX_RESOURCE_STATE_UNORDERED_ACCESS : FFX_RESOURCE_STATE_COMPUTE_READ);
 
-    // 1) Optical flow on the final frame (downsampled 2x first for large outputs)
+    // 1) Optical flow (on a downsampled copy when the flow scale is below 100%)
     FfxResource ofColor = color;
-    if (d.flowScale > 1 && p.colorView) {
+    if (d.ofW != d.w && p.colorView) {
         d.transition(cmd, d.small, VK_IMAGE_LAYOUT_GENERAL);
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, d.downPipe);
         VkDescriptorImageInfo si{d.linearDown, p.colorView, p.colorInGeneral ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
@@ -398,10 +444,54 @@ bool FrameGen::record(VkCommandBuffer cmd, const FrameGenParams& p) {
     w[0].dstBinding = 0; w[0].descriptorCount = 1; w[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w[0].pImageInfo = &fi;
     w[1].dstBinding = 1; w[1].descriptorCount = 1; w[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; w[1].pImageInfo = &mi;
     d.push(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, d.layout, 0, 2, w);
-    uint32_t pc[4] = {d.w, d.h, d.blockSize, d.flowScale};
-    vkCmdPushConstants(cmd, d.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, pc);
+    struct { uint32_t w, h, block; float sx, sy; } pc{d.w, d.h, d.blockSize, float(d.w) / float(d.ofW), float(d.h) / float(d.ofH)};
+    vkCmdPushConstants(cmd, d.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
     vkCmdDispatch(cmd, (d.w + 7) / 8, (d.h + 7) / 8, 1);
     d.transition(cmd, d.motion, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+
+    // Predict mode: clean up the motion field for the renderer's forward warp and stop here.
+    if (p.predict) {
+        if (!p.colorView) { lastError = "predict mode needs a colour view"; return false; }
+        Img& prevRead = d.prevFinal[d.prevIdx];
+        Img& prevWrite = d.prevFinal[1 - d.prevIdx];
+        d.transition(cmd, prevRead, VK_IMAGE_LAYOUT_GENERAL);
+        d.transition(cmd, prevWrite, VK_IMAGE_LAYOUT_GENERAL);
+        d.transition(cmd, d.predMv, VK_IMAGE_LAYOUT_GENERAL);
+        Img& histRead = d.mvHist[d.histIdx];
+        Img& histWrite = d.mvHist[1 - d.histIdx];
+        d.transition(cmd, histRead, VK_IMAGE_LAYOUT_GENERAL);
+        d.transition(cmd, histWrite, VK_IMAGE_LAYOUT_GENERAL);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, d.pPipe);
+        VkDescriptorImageInfo c0{d.nearest, p.colorView, p.colorInGeneral ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+        VkDescriptorImageInfo c1{d.linear, prevRead.view, VK_IMAGE_LAYOUT_GENERAL};
+        VkDescriptorImageInfo c2{d.nearest, d.motion.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+        VkDescriptorImageInfo s0{VK_NULL_HANDLE, d.predMv.view, VK_IMAGE_LAYOUT_GENERAL};
+        VkDescriptorImageInfo s1{VK_NULL_HANDLE, prevWrite.view, VK_IMAGE_LAYOUT_GENERAL};
+        VkDescriptorImageInfo h0{d.linear, histRead.view, VK_IMAGE_LAYOUT_GENERAL};
+        VkDescriptorImageInfo h1{VK_NULL_HANDLE, histWrite.view, VK_IMAGE_LAYOUT_GENERAL};
+        VkDescriptorImageInfo* pinfo[7] = {&c0, &c1, &c2, &s0, &s1, &h0, &h1};
+        VkWriteDescriptorSet pw[7];
+        for (int i = 0; i < 7; i++) {
+            pw[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            pw[i].dstBinding = uint32_t(i);
+            pw[i].descriptorCount = 1;
+            pw[i].descriptorType = (i < 3 || i == 5) ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            pw[i].pImageInfo = pinfo[i];
+        }
+        d.push(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, d.pLayout, 0, 7, pw);
+        const bool hp = d.havePrev && !reset;
+        struct { uint32_t w, h, havePrev, check; float maxPx; uint32_t haveHist; } ppc{d.w, d.h, hp ? 1u : 0u, p.lockStatic ? 1u : 0u, 0.08f * float(d.w),
+                                                                                       (hp && d.haveHist) ? 1u : 0u};
+        vkCmdPushConstants(cmd, d.pLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof ppc, &ppc);
+        vkCmdDispatch(cmd, (d.w + 7) / 8, (d.h + 7) / 8, 1);
+        d.transition(cmd, d.predMv, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        d.prevIdx = 1 - d.prevIdx;
+        d.histIdx = 1 - d.histIdx;
+        d.haveHist = hp;  // the history just written holds real motion only if there was a previous frame
+        d.havePrev = true;
+        d.counterPending = false;
+        return true;
+    }
 
     FfxResource dilDepth = d.res(d.dilDepth, L"PG_FgDilDepth", FFX_RESOURCE_STATE_UNORDERED_ACCESS, FFX_RESOURCE_USAGE_UAV);
     FfxResource dilMotion = d.res(d.dilMotion, L"PG_FgDilMotion", FFX_RESOURCE_STATE_UNORDERED_ACCESS, FFX_RESOURCE_USAGE_UAV);
@@ -535,5 +625,8 @@ bool FrameGen::record(VkCommandBuffer cmd, const FrameGenParams& p) {
 }
 
 VkImageView FrameGen::outputView() const { return d_->output.view; }
+VkImageView FrameGen::predictMotionView() const { return d_->predMv.view; }
+uint32_t FrameGen::flowWidth() const { return d_->ofW; }
+uint32_t FrameGen::flowHeight() const { return d_->ofH; }
 uint32_t FrameGen::width() const { return d_->w; }
 uint32_t FrameGen::height() const { return d_->h; }

@@ -7,7 +7,10 @@ It includes or loads the following third-party components, which keep their own 
 |---|---|---|
 | fsr4-vk (FSR 4.1 Vulkan implementation) | `third_party/fsr4-vk/`, loaded at runtime as `amd_fidelityfx_upscaler_vk.so` | GPL-3.0-only (its own code); AMD FSR 4 assets as described in `third_party/fsr4-vk/THIRD_PARTY_NOTICES.md` |
 | AMD FidelityFX SDK 1.1.4 (FSR 3.1 upscaler, optical flow, frame interpolation, Vulkan backend) | `third_party/fidelityfx/` | MIT |
-| AMD FidelityFX FSR 1 | `third_party/fsr1/` | MIT |
+| AMD FidelityFX FSR 1 | `third_party/fsr1/` (submodule) | MIT |
+| AMD FidelityFX CAS (contrast adaptive sharpening) | `third_party/cas/` (submodule) | MIT |
+| NVIDIA Image Scaling (NIS) 1.0.3 | `third_party/nis/` (submodule) | MIT |
+| Anime4K CNN upscalers (bloc97) | `third_party/anime4k/` | MIT |
 | AMD FidelityFX API headers (SDK 2.x) | `third_party/ffx-api/` | MIT (FFX_API_ENTRY patched for non-Windows) |
 | Dear ImGui 1.92.5 | `third_party/imgui/` | MIT |
 | Vulkan-Headers 1.4.363 | `third_party/vulkan-headers/` | Apache-2.0 / MIT |

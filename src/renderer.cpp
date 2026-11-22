@@ -16,6 +16,10 @@
 
 void fsrEasuConstants(uint32_t con[16], float inW, float inH, float outW, float outH);
 void fsrRcasConstants(uint32_t con[4], float sharpnessStops);
+void casConstants(uint32_t con[8], float sharpness, float w, float h);
+void nisScalerConfig(void* out112, float sharpness, uint32_t inW, uint32_t inH, uint32_t outW, uint32_t outH);
+const float* nisCoefScale();
+const float* nisCoefUsm();
 
 static const uint32_t kYuvSpv[] =
 #include "yuv.comp.inc"
@@ -28,6 +32,15 @@ static const uint32_t kRcasSpv[] =
     ;
 static const uint32_t kBlitVertSpv[] =
 #include "blit.vert.inc"
+    ;
+static const uint32_t kCasSpv[] =
+#include "cas.comp.inc"
+    ;
+static const uint32_t kNisSpv[] =
+#include "nis.comp.inc"
+    ;
+static const uint32_t kPredictSpv[] =
+#include "predict.comp.inc"
     ;
 static const uint32_t kBlitFragSpv[] =
 #include "blit.frag.inc"
@@ -166,6 +179,7 @@ bool Renderer::init(SDL_Window* window, PresentMode pm, std::string& err) {
         ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
         ai.commandBufferCount = 1;
         vkAllocateCommandBuffers(device_, &ai, &f.cmd);
+        vkAllocateCommandBuffers(device_, &ai, &f.cmdAfter);
         VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
         fi.flags = VK_FENCE_CREATE_SIGNALED_BIT;
         vkCreateFence(device_, &fi, nullptr, &f.fence);
@@ -191,6 +205,8 @@ bool Renderer::init(SDL_Window* window, PresentMode pm, std::string& err) {
     std::string terr;
     if (!temporal_.init(instance_, phys_, device_, terr)) { temporalStatus = terr; fprintf(stderr, "FSR 3 unavailable: %s\n", terr.c_str()); }
     if (!fg_.init(phys_, device_, terr)) { frameGenStatus = terr; fprintf(stderr, "Frame generation unavailable: %s\n", terr.c_str()); }
+    if (!a4k_.init(phys_, device_, terr)) fprintf(stderr, "Anime4K unavailable: %s\n", terr.c_str());
+    if (!uploadNisCoefficients()) fprintf(stderr, "NIS unavailable: coefficient upload failed\n");
     return true;
 }
 
@@ -220,6 +236,8 @@ void Renderer::shutdown() {
     if (imguiReady_) { ImGui_ImplVulkan_Shutdown(); imguiReady_ = false; }
     temporal_.shutdown();
     fg_.shutdown();
+    a4k_.shutdown();
+    for (Image* i : {&cas_, &casG_, &nis_, &nisG_, &pred_, &coefScale_, &coefUsm_}) destroyImage(*i);
     destroyImage(src_);
     destroyImage(easu_);
     destroyImage(rcas_);
@@ -231,7 +249,11 @@ void Renderer::shutdown() {
         vkDestroyFence(device_, f.fence, nullptr);
         vkDestroySemaphore(device_, f.acquired, nullptr);
     }
-    for (VkPipeline p : {yuvPipe_, easuPipe_, rcasPipe_, blitPipe_}) vkDestroyPipeline(device_, p, nullptr);
+    for (VkPipeline p : {yuvPipe_, easuPipe_, rcasPipe_, blitPipe_, casPipe_, nisPipe_, predPipe_}) vkDestroyPipeline(device_, p, nullptr);
+    vkDestroyPipelineLayout(device_, nisLayout_, nullptr);
+    vkDestroyDescriptorSetLayout(device_, nisSetLayout_, nullptr);
+    vkDestroyPipelineLayout(device_, predLayout_, nullptr);
+    vkDestroyDescriptorSetLayout(device_, predSetLayout_, nullptr);
     for (VkPipelineLayout l : {yuvLayout_, fsrLayout_, blitLayout_}) vkDestroyPipelineLayout(device_, l, nullptr);
     for (VkDescriptorSetLayout l : {yuvSetLayout_, fsrSetLayout_, blitSetLayout_}) vkDestroyDescriptorSetLayout(device_, l, nullptr);
     vkDestroySampler(device_, linear_, nullptr);
@@ -410,6 +432,26 @@ bool Renderer::createPipelines() {
     yuvPipe_ = compute(kYuvSpv, sizeof kYuvSpv, yuvLayout_);
     easuPipe_ = compute(kEasuSpv, sizeof kEasuSpv, fsrLayout_);
     rcasPipe_ = compute(kRcasSpv, sizeof kRcasSpv, fsrLayout_);
+    casPipe_ = compute(kCasSpv, sizeof kCasSpv, fsrLayout_);  // same bindings as FSR 1 (sampler + storage)
+    {
+        VkDescriptorSetLayoutBinding nb[5] = {
+            {0, VK_DESCRIPTOR_TYPE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+            {1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+            {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+            {3, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+            {4, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}};
+        VkDescriptorSetLayoutCreateInfo ci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        ci.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
+        ci.bindingCount = 5;
+        ci.pBindings = nb;
+        vkCreateDescriptorSetLayout(device_, &ci, nullptr, &nisSetLayout_);
+        nisLayout_ = pipeLayout(nisSetLayout_, 112, VK_SHADER_STAGE_COMPUTE_BIT);
+        nisPipe_ = compute(kNisSpv, sizeof kNisSpv, nisLayout_);
+    }
+    predSetLayout_ = setLayout({VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE},
+                               VK_SHADER_STAGE_COMPUTE_BIT);
+    predLayout_ = pipeLayout(predSetLayout_, 20, VK_SHADER_STAGE_COMPUTE_BIT);
+    predPipe_ = compute(kPredictSpv, sizeof kPredictSpv, predLayout_);
 
     VkShaderModule vs = shader(kBlitVertSpv, sizeof kBlitVertSpv), fs = shader(kBlitFragSpv, sizeof kBlitFragSpv);
     VkPipelineShaderStageCreateInfo stages[2] = {
@@ -466,16 +508,16 @@ uint32_t Renderer::memType(uint32_t bits, VkMemoryPropertyFlags want, VkMemoryPr
     return 0;
 }
 
-bool Renderer::createImage(Image& img, uint32_t w, uint32_t h) {
+bool Renderer::createImage(Image& img, uint32_t w, uint32_t h, VkFormat fmt, VkImageUsageFlags usage) {
     destroyImage(img);
     VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     ci.imageType = VK_IMAGE_TYPE_2D;
-    ci.format = VK_FORMAT_R8G8B8A8_UNORM;
+    ci.format = fmt;
     ci.extent = {w, h, 1};
     ci.mipLevels = ci.arrayLayers = 1;
     ci.samples = VK_SAMPLE_COUNT_1_BIT;
     ci.tiling = VK_IMAGE_TILING_OPTIMAL;
-    ci.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    ci.usage = usage;
     VK_CHECK(vkCreateImage(device_, &ci, nullptr, &img.image));
     VkMemoryRequirements req;
     vkGetImageMemoryRequirements(device_, img.image, &req);
@@ -566,6 +608,63 @@ void Renderer::pushImageSampler(VkCommandBuffer cmd, VkPipelineBindPoint bp, VkP
     pushDesc_(cmd, bp, layout, 0, storage ? 2 : 1, w);
 }
 
+// NIS needs its 64-phase x 8-tap filter tables as 2x64 RGBA32F textures; uploaded once.
+bool Renderer::uploadNisCoefficients() {
+    const VkImageUsageFlags u = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    if (!createImage(coefScale_, 2, 64, VK_FORMAT_R32G32B32A32_SFLOAT, u) || !createImage(coefUsm_, 2, 64, VK_FORMAT_R32G32B32A32_SFLOAT, u)) return false;
+    const VkDeviceSize bytes = 2 * 64 * 4 * sizeof(float);
+    VkBuffer staging;
+    VkDeviceMemory mem;
+    VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bci.size = bytes * 2;
+    bci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    if (vkCreateBuffer(device_, &bci, nullptr, &staging) != VK_SUCCESS) return false;
+    VkMemoryRequirements req;
+    vkGetBufferMemoryRequirements(device_, staging, &req);
+    VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    ai.allocationSize = req.size;
+    ai.memoryTypeIndex = memType(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 0);
+    vkAllocateMemory(device_, &ai, nullptr, &mem);
+    vkBindBufferMemory(device_, staging, mem, 0);
+    void* map = nullptr;
+    vkMapMemory(device_, mem, 0, VK_WHOLE_SIZE, 0, &map);
+    memcpy(map, nisCoefScale(), bytes);
+    memcpy(static_cast<uint8_t*>(map) + bytes, nisCoefUsm(), bytes);
+    vkUnmapMemory(device_, mem);
+
+    VkCommandBufferAllocateInfo cai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    cai.commandPool = pool_;
+    cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cai.commandBufferCount = 1;
+    VkCommandBuffer cmd;
+    vkAllocateCommandBuffers(device_, &cai, &cmd);
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cmd, &bi);
+    for (int i = 0; i < 2; i++) {
+        Image& img = i == 0 ? coefScale_ : coefUsm_;
+        barrier(cmd, img.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                VK_PIPELINE_STAGE_2_NONE, 0, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+        VkBufferImageCopy region{};
+        region.bufferOffset = i * bytes;
+        region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        region.imageExtent = {2, 64, 1};
+        vkCmdCopyBufferToImage(cmd, staging, img.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+        barrier(cmd, img.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+    }
+    vkEndCommandBuffer(cmd);
+    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &cmd;
+    vkQueueSubmit(queue_, 1, &si, VK_NULL_HANDLE);
+    vkQueueWaitIdle(queue_);
+    vkFreeCommandBuffers(device_, pool_, 1, &cmd);
+    vkDestroyBuffer(device_, staging, nullptr);
+    vkFreeMemory(device_, mem, nullptr);
+    return true;
+}
+
 Rect Renderer::fitRect(Rect a, uint32_t sw, uint32_t sh, ScaleMode m) {
     if (!sw || !sh || a.w <= 0 || a.h <= 0 || m == ScaleMode::Stretch) return a;
     float s = std::min(a.w / sw, a.h / sh);
@@ -595,6 +694,7 @@ bool Renderer::render(const FrameInput* in, const RenderParams& p, ImDrawData* d
         if (vkGetQueryPoolResults(device_, queries_, cur_ * 4, 4, sizeof ts, ts, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
             auto ms = [&](uint64_t a, uint64_t b) { return float(double(b - a) * tsPeriod_ / 1e6); };
             gpu = {ms(ts[0], ts[1]), ms(ts[1], ts[2]), ms(ts[2], ts[3]), ms(ts[0], ts[3]), true};
+            if (f.hadInput) gpuWork = gpu;
         }
     }
 
@@ -645,18 +745,43 @@ bool Renderer::render(const FrameInput* in, const RenderParams& p, ImDrawData* d
             temporalStatus = terr;
         }
     }
+    // Spatial upscalers: NIS (output = window size) and Anime4K (fixed 2x, resized to the window).
+    if (effectiveUpscaler == Upscaler::Off && canUpscale && p.upscaler == Upscaler::NIS && nisAvailable()) {
+        if (nis_.w != dstW || nis_.h != dstH) {
+            vkDeviceWaitIdle(device_);
+            createImage(nis_, dstW, dstH);
+            spatialDirty_ = true;
+        }
+        effectiveUpscaler = Upscaler::NIS;
+    }
+    if (effectiveUpscaler == Upscaler::Off && canUpscale && p.upscaler == Upscaler::Anime4K && a4k_.available()) {
+        std::string aerr;
+        if (a4k_.ensure(p.anime4kVariant, inW, inH, aerr)) {
+            effectiveUpscaler = Upscaler::Anime4K;
+            temporalStatus.clear();
+        } else {
+            temporalStatus = aerr;
+        }
+    }
     if (effectiveUpscaler == Upscaler::Off && canUpscale && p.upscaler != Upscaler::Off) effectiveUpscaler = Upscaler::FSR1;
     // FSR 3/4 only re-run on a new capture frame; otherwise the last output is reused.
     if (in) temporalInputFresh_ = true;
     const bool temporalMode = effectiveUpscaler == Upscaler::FSR3 || effectiveUpscaler == Upscaler::FSR4;
-    outW = temporalMode ? tW : dstW;
-    outH = temporalMode ? tH : dstH;
-    comparing = p.compare && temporalMode && !p.debugMotion && canUpscale;
+    const bool a4kMode = effectiveUpscaler == Upscaler::Anime4K, nisMode = effectiveUpscaler == Upscaler::NIS;
+    const bool postMode = temporalMode || a4kMode || nisMode;  // frame gen runs after these upscalers
+    outW = temporalMode ? tW : a4kMode ? a4k_.outW() : dstW;
+    outH = temporalMode ? tH : a4kMode ? a4k_.outH() : dstH;
+    comparing = p.compare && postMode && !p.debugMotion && canUpscale;
     lastDst = dst;
-    // Frame generation: with Off/FSR 1 it runs at capture resolution before upscaling (about 4x
-    // cheaper than at 4K); with FSR 3/4 it must run after the temporal upscaler.
+    // CAS: sharpen at native resolution whenever nothing upscales (Upscaling off, or the window isn't bigger).
+    const bool casMode = effectiveUpscaler == Upscaler::Off && p.sharpness > 0.0f && haveInput && inW && inH;
+    // Frame generation runs at capture resolution, before upscaling (about 4x cheaper than at 4K).
+    // The generated frame then gets the same spatial upscaler; FSR 1 stands in for FSR 3/4, whose
+    // history must only ever see real frames. Predict mode only computes motion here.
+    (void)postMode;
     bool fgThis = p.frameGen && fg_.available() && in && !p.debugMotion && !comparing;
-    const bool fgPre = fgThis && !temporalMode;
+    const bool fgPredict = fgThis && p.fgPredict;
+    const bool fgPre = fgThis && !fgPredict;  // a generated frame is made (and upscaled) this frame
     const bool needFsr1 = canUpscale && (effectiveUpscaler == Upscaler::FSR1 || comparing);
     if (needFsr1 && (easu_.w != dstW || easu_.h != dstH)) {
         vkDeviceWaitIdle(device_);
@@ -664,18 +789,40 @@ bool Renderer::render(const FrameInput* in, const RenderParams& p, ImDrawData* d
         createImage(rcas_, dstW, dstH);
         upscaleDirty_ = true;
     }
-    if (fgPre && effectiveUpscaler == Upscaler::FSR1 && (easuG_.w != dstW || easuG_.h != dstH)) {
+    if (fgPre && canUpscale && (effectiveUpscaler == Upscaler::FSR1 || temporalMode) && (easuG_.w != dstW || easuG_.h != dstH)) {
         vkDeviceWaitIdle(device_);
         createImage(easuG_, dstW, dstH);
         createImage(rcasG_, dstW, dstH);
     }
-    if (p.sharpness != lastSharpness_) { lastSharpness_ = p.sharpness; upscaleDirty_ = true; }
+    if (casMode && (cas_.w != inW || cas_.h != inH)) {
+        vkDeviceWaitIdle(device_);
+        createImage(cas_, inW, inH);
+        spatialDirty_ = true;
+    }
+    if (casMode && fgPre && (casG_.w != inW || casG_.h != inH)) {
+        vkDeviceWaitIdle(device_);
+        createImage(casG_, inW, inH);
+    }
+    if (nisMode && fgPre && (nisG_.w != dstW || nisG_.h != dstH)) {
+        vkDeviceWaitIdle(device_);
+        createImage(nisG_, dstW, dstH);
+    }
+    // Predict mode, between real frames: warp the last real frame forward along its motion.
+    predictedShown = false;
+    const bool doPredict = !in && p.predictFrame && p.frameGen && p.fgPredict && predictReady_ && inputValid_ && !comparing && !p.debugMotion;
+    if (doPredict && (pred_.w != dstW || pred_.h != dstH)) {
+        vkDeviceWaitIdle(device_);
+        createImage(pred_, dstW, dstH);
+    }
+    if (in) predictReady_ = false;
+    if (p.sharpness != lastSharpness_) { lastSharpness_ = p.sharpness; upscaleDirty_ = true; spatialDirty_ = true; }
+    if (in) spatialDirty_ = true;
 
     generatedShown = false;
+    bool afterRecorded = false;  // f.cmdAfter holds work to submit after present
     if (fgThis) {
-        uint32_t fw = fgPre ? in->width : tW, fh = fgPre ? in->height : tH;
         std::string ferr;
-        if (fg_.ensure(fw, fh, ferr)) frameGenStatus.clear();
+        if (fg_.ensure(in->width, in->height, p.fgFlowScale, ferr)) frameGenStatus.clear();
         else { frameGenStatus = ferr; fgThis = false; }
     }
 
@@ -707,9 +854,10 @@ bool Renderer::render(const FrameInput* in, const RenderParams& p, ImDrawData* d
         w[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
         w[1].pImageInfo = &imgInfo;
         pushDesc_(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, yuvLayout_, 0, 2, w);
-        uint32_t fmt = in->fourcc == V4L2_PIX_FMT_NV12 ? 0 : in->fourcc == V4L2_PIX_FMT_YUYV ? 1 : 2;
+        uint32_t fmt = in->fourcc == V4L2_PIX_FMT_NV12 ? 0 : in->fourcc == V4L2_PIX_FMT_YUYV ? 1 : in->fourcc == V4L2_PIX_FMT_YUV422P ? 3 : 2;
         uint32_t ySize = in->stride * in->height;
-        uint32_t pc[8] = {in->width, in->height, in->stride, fmt, ySize, ySize + ySize / 4, in->fullRange ? 1u : 0u, in->bt601 ? 1u : 0u};
+        uint32_t cSize = fmt == 3 ? ySize / 2 : ySize / 4;  // one chroma plane
+        uint32_t pc[8] = {in->width, in->height, in->stride, fmt, ySize, ySize + cSize, in->fullRange ? 1u : 0u, in->bt601 ? 1u : 0u};
         vkCmdPushConstants(cmd, yuvLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, pc);
         vkCmdDispatch(cmd, (in->width + 15) / 16, (in->height + 15) / 16, 1);
         barrier(cmd, src_.image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
@@ -770,30 +918,145 @@ bool Renderer::render(const FrameInput* in, const RenderParams& p, ImDrawData* d
         upscaleDirty_ = false;
     }
 
+    // 2b-2) CAS native sharpening, NIS, Anime4K
+    auto runCas = [&](VkImageView srcView, VkImageLayout srcLayout, Image& outImg) {
+        uint32_t con[16] = {};
+        casConstants(con, std::clamp(p.sharpness, 0.0f, 1.0f), float(outImg.w), float(outImg.h));
+        barrier(cmd, outImg.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+                kReaders, 0, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, casPipe_);
+        pushImageSampler(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, fsrLayout_, srcView, nearest_, outImg.view, srcLayout);
+        vkCmdPushConstants(cmd, fsrLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof con, con);
+        vkCmdDispatch(cmd, (outImg.w + 15) / 16, (outImg.h + 15) / 16, 1);
+        barrier(cmd, outImg.image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT, kReaders, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+    };
+    if (casMode && inputValid_ && spatialDirty_ && cas_.w == inW) runCas(src_.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, cas_);
+    auto runNis = [&](VkImageView srcView, VkImageLayout srcLayout, Image& outImg) {
+        uint8_t cfg[112];
+        nisScalerConfig(cfg, std::clamp(p.sharpness, 0.0f, 1.0f), inW, inH, outImg.w, outImg.h);
+        barrier(cmd, outImg.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+                kReaders, 0, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, nisPipe_);
+        VkDescriptorImageInfo smp{linear_, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED};
+        VkDescriptorImageInfo inp{VK_NULL_HANDLE, srcView, srcLayout};
+        VkDescriptorImageInfo outp{VK_NULL_HANDLE, outImg.view, VK_IMAGE_LAYOUT_GENERAL};
+        VkDescriptorImageInfo cs{VK_NULL_HANDLE, coefScale_.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+        VkDescriptorImageInfo cu{VK_NULL_HANDLE, coefUsm_.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+        VkDescriptorImageInfo* infos[5] = {&smp, &inp, &outp, &cs, &cu};
+        const VkDescriptorType types[5] = {VK_DESCRIPTOR_TYPE_SAMPLER, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                                           VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE};
+        VkWriteDescriptorSet nw[5];
+        for (int i = 0; i < 5; i++) {
+            nw[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            nw[i].dstBinding = uint32_t(i);
+            nw[i].descriptorCount = 1;
+            nw[i].descriptorType = types[i];
+            nw[i].pImageInfo = infos[i];
+        }
+        pushDesc_(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, nisLayout_, 0, 5, nw);
+        vkCmdPushConstants(cmd, nisLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof cfg, cfg);
+        vkCmdDispatch(cmd, (outImg.w + 31) / 32, (outImg.h + 23) / 24, 1);  // NIS_BLOCK_WIDTH x NIS_BLOCK_HEIGHT
+        barrier(cmd, outImg.image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT, kReaders, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+    };
+    if (nisMode && inputValid_ && spatialDirty_) runNis(src_.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, nis_);
+    if (a4kMode && inputValid_ && in) a4k_.record(cmd, src_.view);
+    spatialDirty_ = false;
+
     // 2c) Frame generation: frame halfway between the previous and this one
     VkImageView genView = VK_NULL_HANDLE;
     VkImageLayout genLayout = VK_IMAGE_LAYOUT_GENERAL;
     bool genNearest = false;
     if (fgThis && inputValid_) {
         FrameGenParams fp;
-        if (temporalMode) { fp.color = temporal_.outputImage(); fp.colorInfo = temporal_.outputInfo(); fp.colorView = temporal_.outputView(); fp.colorInGeneral = true; }
-        else { fp.color = src_.image; fp.colorInfo = src_.info; fp.colorView = src_.view; }  // before upscaling
+        fp.color = src_.image;  // capture resolution, before upscaling
+        fp.colorInfo = src_.info;
+        fp.colorView = src_.view;
         fp.lockStatic = p.fgLock;
         fp.frameTimeMs = p.frameTimeMs;
+        fp.predict = fgPredict;
+        fp.reset = fgPredict != lastPredict_;  // switching modes: the other path's history is stale
+        lastPredict_ = fgPredict;
+        const bool tempNow = effectiveUpscaler == Upscaler::FSR3 || effectiveUpscaler == Upscaler::FSR4;
         bool sizeOk = fp.colorInfo.extent.width == fg_.width() && fp.colorInfo.extent.height == fg_.height();
-        if (sizeOk && fg_.record(cmd, fp)) {
+        // Predict mode: the motion is only needed for the predicted frame half a frame later, so it is
+        // recorded into a second command buffer submitted after this frame is presented (the real
+        // frame doesn't wait for it).
+        VkCommandBuffer fgCmd = cmd;
+        if (sizeOk && fgPredict) {
+            VkCommandBufferBeginInfo abi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+            abi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+            vkBeginCommandBuffer(f.cmdAfter, &abi);
+            fgCmd = f.cmdAfter;
+        }
+        const bool recorded = sizeOk && fg_.record(fgCmd, fp);
+        if (fgCmd != cmd) {
+            vkEndCommandBuffer(f.cmdAfter);
+            afterRecorded = true;
+        }
+        if (recorded && fgPredict) {
+            predictReady_ = true;  // the real frame is shown now; the predicted one follows
+        } else if (recorded) {
             generatedShown = true;
-            if (fgPre && effectiveUpscaler == Upscaler::FSR1 && easuG_.w == dstW) {
+            if ((effectiveUpscaler == Upscaler::FSR1 || tempNow) && canUpscale && easuG_.w == dstW && easuG_.h == dstH) {
                 runFsr1(fg_.outputView(), VK_IMAGE_LAYOUT_GENERAL, easuG_, rcasG_);  // upscale the generated frame too
                 genView = rcasG_.view;
                 genLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
                 genNearest = true;
+            } else if (nisMode && nisG_.w == dstW && nisG_.h == dstH) {
+                runNis(fg_.outputView(), VK_IMAGE_LAYOUT_GENERAL, nisG_);
+                genView = nisG_.view;
+                genLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                genNearest = true;
+            } else if (a4kMode) {
+                a4k_.record(cmd, fg_.outputView(), VK_IMAGE_LAYOUT_GENERAL, 1);
+                genView = a4k_.outputView(1);
+                genLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                genNearest = a4k_.outW() == dstW && a4k_.outH() == dstH;
+            } else if (casMode && casG_.w == inW) {
+                runCas(fg_.outputView(), VK_IMAGE_LAYOUT_GENERAL, casG_);  // sharpen it like the real frames
+                genView = casG_.view;
+                genLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
             } else {
                 genView = fg_.outputView();
                 genNearest = fg_.width() == dstW && fg_.height() == dstH;
             }
         } else if (!sizeOk) frameGenStatus = "upscaler changed this frame";
         else frameGenStatus = fg_.lastError;
+    }
+    // 2d) Predict mode: last real frame (as shown, after upscaling) warped forward half a frame
+    if (doPredict && pred_.w == dstW && pred_.h == dstH) {
+        VkImageLayout rl = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        VkImageView rv = src_.view;
+        if (effectiveUpscaler == Upscaler::FSR3 || effectiveUpscaler == Upscaler::FSR4) { rv = temporal_.outputView(); rl = VK_IMAGE_LAYOUT_GENERAL; }
+        else if (nisMode) rv = nis_.view;
+        else if (a4kMode) rv = a4k_.outputView(0);
+        else if (effectiveUpscaler == Upscaler::FSR1) rv = rcas_.view;
+        else if (casMode && cas_.w == inW) rv = cas_.view;
+        barrier(cmd, pred_.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+                kReaders, 0, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, predPipe_);
+        VkDescriptorImageInfo ri{linear_, rv, rl};
+        VkDescriptorImageInfo mi{linear_, fg_.predictMotionView(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+        VkDescriptorImageInfo oi{VK_NULL_HANDLE, pred_.view, VK_IMAGE_LAYOUT_GENERAL};
+        VkDescriptorImageInfo* pinfo[3] = {&ri, &mi, &oi};
+        VkWriteDescriptorSet pw[3];
+        for (int i = 0; i < 3; i++) {
+            pw[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            pw[i].dstBinding = uint32_t(i);
+            pw[i].descriptorCount = 1;
+            pw[i].descriptorType = i < 2 ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            pw[i].pImageInfo = pinfo[i];
+        }
+        pushDesc_(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, predLayout_, 0, 3, pw);
+        struct { uint32_t w, h; float fgW, fgH, amount; } ppc{pred_.w, pred_.h, float(fg_.width()), float(fg_.height()), 0.5f};
+        vkCmdPushConstants(cmd, predLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof ppc, &ppc);
+        vkCmdDispatch(cmd, (pred_.w + 7) / 8, (pred_.h + 7) / 8, 1);
+        barrier(cmd, pred_.image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+        predictedShown = true;
+        predictReady_ = false;  // one predicted frame per real frame
     }
     if (queries_) vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, queries_, cur_ * 4 + 2);
 
@@ -826,11 +1089,20 @@ bool Renderer::render(const FrameInput* in, const RenderParams& p, ImDrawData* d
                 pushImageSampler(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, blitLayout_, genView, genNearest ? nearest_ : linear_, VK_NULL_HANDLE, genLayout);
             else if (showingMotion)
                 pushImageSampler(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, blitLayout_, temporal_.debugView(), linear_, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_GENERAL);
+            else if (predictedShown)
+                pushImageSampler(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, blitLayout_, pred_.view, nearest_, VK_NULL_HANDLE);
             else if (effectiveUpscaler == Upscaler::FSR3 || effectiveUpscaler == Upscaler::FSR4)
                 pushImageSampler(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, blitLayout_, temporal_.outputView(),
                                  (tW == dstW && tH == dstH) ? nearest_ : linear_, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_GENERAL);
+            else if (nisMode)
+                pushImageSampler(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, blitLayout_, nis_.view, nearest_, VK_NULL_HANDLE);
+            else if (a4kMode)
+                pushImageSampler(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, blitLayout_, a4k_.outputView(),
+                                 (a4k_.outW() == dstW && a4k_.outH() == dstH) ? nearest_ : linear_, VK_NULL_HANDLE);
             else if (effectiveUpscaler == Upscaler::FSR1)
                 pushImageSampler(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, blitLayout_, rcas_.view, nearest_, VK_NULL_HANDLE);
+            else if (casMode && cas_.w == inW)
+                pushImageSampler(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, blitLayout_, cas_.view, linear_, VK_NULL_HANDLE);
             else
                 pushImageSampler(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, blitLayout_, src_.view, linear_, VK_NULL_HANDLE);
             if (comparing) {
@@ -893,8 +1165,11 @@ bool Renderer::render(const FrameInput* in, const RenderParams& p, ImDrawData* d
     si.pCommandBuffers = &cmd;
     si.signalSemaphoreCount = 1;
     si.pSignalSemaphores = &renderDone_[imgIdx];
-    VK_CHECK(vkQueueSubmit(queue_, 1, &si, f.fence));
+    // With work after present, the fence goes on that later submission; a fence signal covers
+    // everything earlier in submission order, so it still guards this one too.
+    VK_CHECK(vkQueueSubmit(queue_, 1, &si, afterRecorded ? VK_NULL_HANDLE : f.fence));
     f.queried = queries_ != VK_NULL_HANDLE;
+    f.hadInput = in != nullptr;
     lastSubmitNs = nowNs();
 
     VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
@@ -906,6 +1181,12 @@ bool Renderer::render(const FrameInput* in, const RenderParams& p, ImDrawData* d
     VkResult pr = vkQueuePresentKHR(queue_, &pi);
     if (pr == VK_ERROR_OUT_OF_DATE_KHR || pr == VK_SUBOPTIMAL_KHR) swapchainDirty_ = true;
     lastPresentReturnNs = nowNs();
+    if (afterRecorded) {
+        VkSubmitInfo ai{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        ai.commandBufferCount = 1;
+        ai.pCommandBuffers = &f.cmdAfter;
+        VK_CHECK(vkQueueSubmit(queue_, 1, &ai, f.fence));
+    }
     if (shot) {
         vkWaitForFences(device_, 1, &f.fence, VK_TRUE, UINT64_MAX);
         writeScreenshot();

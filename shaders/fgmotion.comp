@@ -4,7 +4,7 @@
 layout(local_size_x = 8, local_size_y = 8) in;
 layout(binding = 0) uniform isampler2D flow;
 layout(rg16f, binding = 1) writeonly uniform image2D motion;
-layout(push_constant) uniform PC { uint width; uint height; uint blockSize; uint flowScale; } pc;  // flowScale: display px per flow px
+layout(push_constant) uniform PC { uint width; uint height; uint blockSize; float scaleX; float scaleY; } pc;  // scale: frame px per flow px
 
 vec2 fetchFlow(ivec2 b) {
     ivec2 sz = textureSize(flow, 0);
@@ -15,10 +15,11 @@ vec2 fetchFlow(ivec2 b) {
 void main() {
     uvec2 p = gl_GlobalInvocationID.xy;
     if (p.x >= pc.width || p.y >= pc.height) return;
-    vec2 fb = (vec2(p) + 0.5) / float(pc.blockSize * pc.flowScale) - 0.5;
+    vec2 scale = vec2(pc.scaleX, pc.scaleY);
+    vec2 fb = (vec2(p) + 0.5) / (float(pc.blockSize) * scale) - 0.5;
     ivec2 b0 = ivec2(floor(fb));
     vec2 t = fb - vec2(b0);
     vec2 v = mix(mix(fetchFlow(b0), fetchFlow(b0 + ivec2(1, 0)), t.x),
                  mix(fetchFlow(b0 + ivec2(0, 1)), fetchFlow(b0 + ivec2(1, 1)), t.x), t.y);
-    imageStore(motion, ivec2(p), vec4(v * float(pc.flowScale), 0.0, 0.0));
+    imageStore(motion, ivec2(p), vec4(v * scale, 0.0, 0.0));
 }

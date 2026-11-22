@@ -120,10 +120,15 @@ int main(int argc, char** argv) {
     app.settings.load();
     int selftestSec = 0;
     const Upscaler savedUpscaler = app.settings.upscaler;  // CLI overrides below are for this run only
-    const bool savedFrameGen = app.settings.frameGen;
+    const bool savedFrameGen = app.settings.frameGen, savedPredict = app.settings.fgPredict;
+    const int savedFlow = app.settings.fgFlowScale;
+    bool cliPredict = false, cliFlow = false;
     bool cliUpscaler = false, cliFrameGen = false;
     const int savedQuality = app.settings.fsrQuality;
     bool cliQuality = false;
+    const float savedSharpness = app.settings.sharpness;
+    const int savedA4k = app.settings.anime4kVariant;
+    bool cliSharpness = false, cliA4k = false;
     bool cliFullscreen = false;
     bool noJitter = false, noFgLock = false;
     int testPattern = 0;  // synthetic frames with known motion: 1 = blocks, 2 = smooth
@@ -136,10 +141,19 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--show") && i + 1 < argc) showPanel = argv[++i];  // settings[:tab] | stats | picker
         else if (!strcmp(argv[i], "--upscaler") && i + 1 < argc) {  // off | fsr1 | fsr3 (this run only)
             std::string u = argv[++i];
-            app.settings.upscaler = u == "fsr4" ? Upscaler::FSR4 : u == "fsr3" ? Upscaler::FSR3 : u == "fsr1" ? Upscaler::FSR1 : Upscaler::Off;
+            app.settings.upscaler = u == "fsr4" ? Upscaler::FSR4 : u == "fsr3" ? Upscaler::FSR3 : u == "fsr1" ? Upscaler::FSR1
+                                  : u == "nis" ? Upscaler::NIS : u == "anime4k" ? Upscaler::Anime4K : Upscaler::Off;
             cliUpscaler = true;
         } else if (!strcmp(argv[i], "--debug-motion")) app.debugMotion = true;
         else if (!strcmp(argv[i], "--framegen")) { app.settings.frameGen = true; cliFrameGen = true; }
+        else if (!strcmp(argv[i], "--no-framegen")) { app.settings.frameGen = false; cliFrameGen = true; }
+        else if (!strcmp(argv[i], "--fg-predict")) { app.settings.fgPredict = true; cliPredict = true; }
+        else if (!strcmp(argv[i], "--no-fg-predict")) { app.settings.fgPredict = false; cliPredict = true; }
+        else if (!strcmp(argv[i], "--flow-scale") && i + 1 < argc) {  // auto | 100 | 75 | 50 | 25 (this run only)
+            std::string v = argv[++i];
+            app.settings.fgFlowScale = v == "auto" ? 0 : std::clamp(atoi(v.c_str()), 10, 100);
+            cliFlow = true;
+        }
         else if (!strcmp(argv[i], "--compare")) app.compareView = true;
         else if (!strcmp(argv[i], "--no-jitter")) noJitter = true;
         else if (!strcmp(argv[i], "--no-fglock")) noFgLock = true;
@@ -148,6 +162,12 @@ int main(int argc, char** argv) {
             const char* names[] = {"auto", "native", "quality", "balanced", "performance", "ultra"};
             for (int k = 0; k < 6; k++) if (q == names[k]) app.settings.fsrQuality = k;
             cliQuality = true;
+        }
+        else if (!strcmp(argv[i], "--sharpness") && i + 1 < argc) { app.settings.sharpness = std::clamp(float(atof(argv[++i])), 0.0f, 1.0f); cliSharpness = true; }
+        else if (!strcmp(argv[i], "--anime4k") && i + 1 < argc) {  // s|m|l
+            char v = argv[++i][0];
+            app.settings.anime4kVariant = v == 's' || v == 'S' ? 0 : v == 'l' || v == 'L' ? 2 : 1;
+            cliA4k = true;
         }
         else if (!strcmp(argv[i], "--test-pattern")) testPattern = 1;
         else if (!strcmp(argv[i], "--test-pattern=smooth")) testPattern = 2;
@@ -205,6 +225,8 @@ int main(int argc, char** argv) {
     uint64_t testFrameIdx = 0, lastTestNs = 0;
     bool realPending = false;
     uint64_t realDueNs = 0;
+    bool predPending = false;  // predict mode: a predicted frame is due at predDueNs unless a real one comes first
+    uint64_t predDueNs = 0, lastAcquiredNs = 0;
     CaptureFrame pendingCf{};
 
     if (showPanel.rfind("settings", 0) == 0) {
@@ -225,9 +247,9 @@ int main(int argc, char** argv) {
         // Sleep until a capture frame or input arrives. Idle UI still refreshes ~4x/s for stats.
         bool animating = testPattern != 0 || nowNs() - app.lastInputNs < 600'000'000ull;
         int waitMs = animating ? 8 : 250;
-        if (realPending) {  // a real frame is due shortly after a generated one
-            uint64_t t = nowNs();
-            waitMs = realDueNs > t + 2'000'000 ? int((realDueNs - t) / 1'000'000) - 1 : 0;
+        if (realPending || predPending) {  // a real (or predicted) frame is due shortly
+            uint64_t t = nowNs(), due = realPending ? realDueNs : predDueNs;
+            waitMs = due > t + 2'000'000 ? int((due - t) / 1'000'000) - 1 : 0;
         }
         SDL_Event e;
         bool got = SDL_WaitEventTimeout(&e, waitMs);
@@ -278,6 +300,23 @@ int main(int argc, char** argv) {
                 SDL_DelayPrecise(realDueNs - t);
             }
         }
+        // Predict mode: a new real frame is shown as soon as it arrives; otherwise the predicted
+        // frame goes out half a capture interval after the last real one.
+        bool predictNow = false;
+        if (predPending) {
+            // (The test pattern takes ~17 ms of CPU to draw, so its next frame simply waits for the predicted one.)
+            bool newReal = !testPattern && app.capture.lastFrameNs.load() != lastAcquiredNs;
+            if (newReal || !app.settings.frameGen || !app.settings.fgPredict) {
+                predPending = false;
+            } else {
+                uint64_t t = nowNs();
+                if (t < predDueNs) {
+                    if (predDueNs - t > 1'500'000) { lastStatsTick = now; continue; }
+                    SDL_DelayPrecise(predDueNs - t);
+                }
+                predictNow = true;
+            }
+        }
         bool frameReady = testPattern != 0 || (app.capture.isOpen() && app.capture.lastFrameNs.load() > 0);
         if (!frameReady && !uiEvent && !animating && now - lastRender < 200'000'000ull) { lastStatsTick = now; continue; }
 
@@ -295,18 +334,19 @@ int main(int argc, char** argv) {
         // Grab the newest frame as late as possible, right before upload.
         CaptureFrame cf;
         bool have = !realPending && app.capture.isOpen() && app.capture.acquireLatest(cf);
+        if (have) lastAcquiredNs = cf.dequeueNs;
         FrameInput in;
         if (have) {
             in.data = cf.data;
             in.bytes = cf.bytes;
             in.width = app.capture.width;
             in.height = app.capture.height;
-            in.fourcc = app.capture.fourcc;
-            in.stride = app.capture.stride;
+            in.fourcc = cf.fourcc;  // MJPEG arrives already decoded to planar YUV
+            in.stride = cf.stride;
             in.bt601 = app.settings.matrix == ColorMatrix::BT601 || (app.settings.matrix == ColorMatrix::Auto && in.height < 720);
             in.fullRange = app.settings.range == ColorRange::Full;
         }
-        if (testPattern && !realPending && nowNs() - lastTestNs >= 16'666'666ull) {
+        if (testPattern && !realPending && !predictNow && nowNs() - lastTestNs >= 16'666'666ull) {
             // Mode 1 (--test-pattern): left half hashed blocks scrolling right 4 px/frame, right half static.
             // Mode 2 (--test-pattern=smooth): anti-aliased stripes + rings repeating every 960 px, so the
             // left and right halves are identical (for split view). Top half moves 1.37 px/frame.
@@ -348,7 +388,10 @@ int main(int argc, char** argv) {
         }
         RenderParams rp{app.videoAreaPx, app.settings.scale, app.settings.upscaler, app.settings.sharpness,
                         app.capture.fps > 0 && !testPattern ? float(1000.0 / app.capture.fps) : 16.67f, app.debugMotion, app.compareView, !noJitter,
-                        app.settings.frameGen, !noFgLock, app.settings.fsrQuality};
+                        app.settings.frameGen, !noFgLock, app.settings.fsrQuality, app.settings.anime4kVariant};
+        rp.fgPredict = app.settings.fgPredict;
+        rp.predictFrame = predictNow && !have;
+        rp.fgFlowScale = app.settings.fgFlowScale;
         if (app.screenshotRequested && !(app.settings.frameGen && app.renderer.frameGenAvailable())) {
             app.screenshotRequested = false;
             const char* home = getenv("HOME");
@@ -369,7 +412,10 @@ int main(int argc, char** argv) {
             strftime(name, sizeof name, "/" APP_ID "-%Y%m%d-%H%M%S-generated.bmp", localtime(&t));
             shotOnGenerated = dir + name;
         }
-        if (!shotOnGenerated.empty() && have) { app.renderer.requestScreenshot(shotOnGenerated); shotOnGenerated.clear(); }
+        if (!shotOnGenerated.empty() && (app.settings.fgPredict ? rp.predictFrame : have)) {  // grab a generated / predicted frame
+            app.renderer.requestScreenshot(shotOnGenerated);
+            shotOnGenerated.clear();
+        }
         bool ok = app.renderer.render(have ? &in : nullptr, rp, ImGui::GetDrawData());
         if (!app.renderer.savedScreenshot.empty()) {
             app.showToast("Screenshot saved: " + app.renderer.savedScreenshot);
@@ -382,6 +428,19 @@ int main(int argc, char** argv) {
         // one follows half a capture interval later and is what latency is measured on.
         bool realShown = false;
         CaptureFrame shownCf = cf;
+        if (predictNow) {  // predict mode: the predicted frame went out (or couldn't be made)
+            predPending = false;
+            if (ok && app.renderer.predictedShown) {
+                app.stats.generatedFrames++;
+                app.stats.genWindowFrames++;
+            }
+        }
+        if (ok && have && app.renderer.predictReady()) {
+            double fps = app.capture.measuredFps.load() > 1 ? app.capture.measuredFps.load() : (app.capture.fps > 0 ? app.capture.fps : 60.0);
+            if (testPattern) fps = 60.0;
+            predPending = true;
+            predDueNs = app.renderer.lastSubmitNs + uint64_t(0.5e9 / fps);
+        }
         if (ok && app.renderer.generatedShown) {
             double fps = app.capture.measuredFps.load() > 1 ? app.capture.measuredFps.load() : (app.capture.fps > 0 ? app.capture.fps : 60.0);
             if (testPattern) fps = 60.0;
@@ -414,10 +473,11 @@ int main(int argc, char** argv) {
             if (ft > 0) s.push(lat, ft);
             auto ema = [](float& v, float x) { v = v == 0 ? x : v * 0.9f + x * 0.1f; };
             ema(s.transfer, float(double(cf.dequeueNs - cf.timestampNs) / 1e6));
-            ema(s.wait, float(double(r.lastRenderStartNs - cf.dequeueNs) / 1e6));
+            ema(s.decode, float(double(cf.decodeNs) / 1e6));
+            ema(s.wait, float(double(r.lastRenderStartNs - cf.dequeueNs - cf.decodeNs) / 1e6));
             ema(s.cpu, float(double(r.lastSubmitNs - r.lastRenderStartNs) / 1e6));
             if (r.gpu.valid) {
-                if (!app.settings.frameGen) {
+                if (!app.settings.frameGen || app.settings.fgPredict) {
                     ema(s.gpuConvert, r.gpu.convert);
                     ema(s.gpuUpscale, r.gpu.upscale);
                 }
@@ -443,14 +503,19 @@ int main(int argc, char** argv) {
             lastReportNs = now;
             auto& r = app.renderer;
             auto& s = app.stats;
-            printf("[selftest] cap %.1f fps | shown %.1f fps | latency avg %.2f p99 %.2f min %.2f ms | xfer %.2f wait %.2f cpu %.2f | "
+            printf("[selftest] cap %.1f fps | shown %.1f fps | latency avg %.2f p99 %.2f min %.2f ms | xfer %.2f dec %.2f wait %.2f cpu %.2f | "
                    "gpu conv %.3f up %.3f comp %.3f | %ux%u %s -> %ux%u %s | dropped %llu+%llu | audio %s %.1f ms | gen %.1f fps\n",
-                   app.capture.measuredFps.load(), s.shownFps, s.latAvg, s.latP99, s.latMin, s.transfer, s.wait, s.cpu,
+                   app.capture.measuredFps.load(), s.shownFps, s.latAvg, s.latP99, s.latMin, s.transfer, s.decode, s.wait, s.cpu,
                    s.gpuConvert, s.gpuUpscale, s.gpuComposite, app.capture.width, app.capture.height, fourccName(app.capture.fourcc),
-                   r.outW, r.outH, r.effectiveUpscaler == Upscaler::FSR4 ? "FSR4" : r.effectiveUpscaler == Upscaler::FSR3 ? "FSR3" : r.effectiveUpscaler == Upscaler::FSR1 ? "FSR1" : "bilinear",
+                   r.outW, r.outH, r.effectiveUpscaler == Upscaler::FSR4 ? "FSR4" : r.effectiveUpscaler == Upscaler::FSR3 ? "FSR3" : r.effectiveUpscaler == Upscaler::FSR1 ? "FSR1"
+                   : r.effectiveUpscaler == Upscaler::NIS ? "NIS" : r.effectiveUpscaler == Upscaler::Anime4K ? "Anime4K" : "native",
                    (unsigned long long)app.capture.framesSkipped.load(), (unsigned long long)app.capture.framesLostByDriver.load(),
                    app.audio.active() ? app.audio.inputName.c_str() : ("off: " + app.audioError).c_str(), app.audio.latencyMs(), s.genFps);
             if (!r.frameGenStatus.empty()) printf("[selftest] frame gen status: %s\n", r.frameGenStatus.c_str());
+            if (testPattern && r.gpuWork.valid) printf("[selftest] pattern gpu: convert %.3f upscale %.3f composite %.3f ms (%s, %ux%u)\n", r.gpuWork.convert, r.gpuWork.upscale, r.gpuWork.present,
+                                                   r.effectiveUpscaler == Upscaler::Off ? "native" : "upscaled", r.outW, r.outH);
+            if (app.settings.frameGen) printf("[selftest] frame gen: %s, flow %ux%u, %llu generated frames\n", app.settings.fgPredict ? "predict" : "interpolate",
+                                              r.frameGenFlowW(), r.frameGenFlowH(), (unsigned long long)app.stats.generatedFrames);
             if (app.settings.frameGen) printf("[selftest] frame gen: %llu skipped for fast motion, last unexplained %.1f%%\n", (unsigned long long)r.frameGenSkipped(), r.frameGenFailedFraction() * 100);
             if (!r.temporalStatus.empty()) printf("[selftest] temporal upscaler status: %s\n", r.temporalStatus.c_str());
             fflush(stdout);
@@ -465,7 +530,11 @@ int main(int argc, char** argv) {
 
     if (cliUpscaler) app.settings.upscaler = savedUpscaler;
     if (cliFrameGen) app.settings.frameGen = savedFrameGen;
+    if (cliPredict) app.settings.fgPredict = savedPredict;
+    if (cliFlow) app.settings.fgFlowScale = savedFlow;
     if (cliQuality) app.settings.fsrQuality = savedQuality;
+    if (cliSharpness) app.settings.sharpness = savedSharpness;
+    if (cliA4k) app.settings.anime4kVariant = savedA4k;
     app.settings.save();
     app.capture.close();
     app.audio.stop();

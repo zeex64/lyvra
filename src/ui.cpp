@@ -307,6 +307,8 @@ const char* upscalerName(Upscaler u) {
         case Upscaler::FSR1: return "FSR 1";
         case Upscaler::FSR3: return "FSR 3";
         case Upscaler::FSR4: return "FSR 4";
+        case Upscaler::NIS: return "NIS";
+        case Upscaler::Anime4K: return "Anime4K";
         default: return "Native";
     }
 }
@@ -374,7 +376,7 @@ void topBar(float W, float y) {
     if (g->renderer.showingMotion) up = "Motion view";
     std::string lat = g->stats.count ? fmt("%.1f ms", g->stats.latAvg) : "-- ms";
     bool fgOn = g->settings.frameGen && g->stats.genFps > 1;
-    const char* fgLabel = fgOn ? "Frame Gen 2×" : g->settings.frameGen ? "Frame Gen · waiting" : "Frame Gen Off";
+    const char* fgLabel = fgOn ? (g->settings.fgPredict ? "Frame Gen 2× · Predict" : "Frame Gen 2×") : g->settings.frameGen ? "Frame Gen · waiting" : "Frame Gen Off";
     float right = chipWidth(up.c_str(), F().semibold) + 8 + chipWidth(fgLabel, F().regular) + 8 +
                   chipWidth(lat.c_str(), F().monoSemibold, 18) + 12 + 36 * 3 + 8;
     float x = W - 16 - right;
@@ -624,7 +626,7 @@ void settingsSource() {
 
     if (g->capture.isOpen()) {
         ImGui::Dummy({0, 14});
-        double mbps = g->capture.width * g->capture.height * fourccBytesPerPixel(g->capture.fourcc) * g->capture.fps / 1e6;
+        double mbps = g->capture.usbMBps();
         std::string usb = usbSpeedFor(g->capture.path);
         std::string info = fmt("Negotiated %s @ %.2f %s · %.0f MB/s%s%s", res(g->capture.width, g->capture.height).c_str(), g->capture.fps,
                                fourccName(g->capture.fourcc), mbps, usb.empty() ? "" : " · USB ", usb.c_str());
@@ -634,14 +636,17 @@ void settingsSource() {
 
 void settingsUpscaling() {
     Settings& st = g->settings;
-    sectionTitle("Upscaling", "Upscales the capture to fit your window on the GPU. FSR 1 is spatial: it adds well under a millisecond and never ghosts.");
+    sectionTitle("Upscaling", "Upscales the capture to fit your window on the GPU. FSR 1, NIS and Anime4K are spatial (this frame only, no ghosting); FSR 3 and 4 are temporal.");
     float avail = ImGui::GetContentRegionAvail().x;
-    int cols = avail > 760 ? 4 : 2;
+    int cols = avail > 700 ? 3 : 2;
     float cw = (avail - 10 * (cols - 1)) / cols, ch = 128;
     struct Opt { Upscaler u; CardText t; bool enabled; const char* tip; };
     Opt opts[] = {
-        {Upscaler::Off, {"Off", nullptr, "Bilinear scaling to fit. The lowest possible cost.", "+0.0 ms"}, true, nullptr},
+        {Upscaler::Off, {"Native", nullptr, "No upscaling. The Sharpness slider applies AMD CAS at native resolution (0 = untouched).", "+0.0–0.1 ms"}, true, nullptr},
         {Upscaler::FSR1, {"FSR 1", "RECOMMENDED", "Spatial edge-aware upscale plus sharpening. No ghosting.", "~0.1–0.4 ms GPU"}, true, nullptr},
+        {Upscaler::NIS, {"NIS", nullptr, "NVIDIA Image Scaling: 6-tap upscale with adaptive sharpening. Spatial, crisp.", "~0.2–0.5 ms GPU"}, g->renderer.nisAvailable(), nullptr},
+        {Upscaler::Anime4K, {"Anime4K", nullptr, "CNN upscaler (2×) made for anime and cel-shaded games. Can over-smooth realistic games.", "~0.3–2 ms GPU"},
+         g->renderer.anime4kAvailable(), "Anime4K by bloc97 (MIT). Doubles the capture resolution with a small neural network, then resizes to the window."},
         {Upscaler::FSR3, {"FSR 3", "EXPERIMENTAL", "Temporal FSR 3.1 using optical flow. Can calm shimmer in motion; similar detail to FSR 1.", "~1–2 ms GPU"}, g->renderer.temporalAvailable(),
          g->renderer.temporalAvailable()
              ? "FSR 3.1 normally gets motion vectors and camera jitter from the game. Here motion is estimated from the video and there's no jitter, so expect steadier edges and less shimmer rather than lots of new detail. Fast or transparent motion can ghost."
@@ -652,20 +657,33 @@ void settingsUpscaling() {
              ? "FSR 4.1 through fsr4-vk, an independent Vulkan implementation using AMD's FSR 4 model (GPL-3.0). Like FSR 3 it gets estimated motion and synthetic jitter, so gains over FSR 1 may be modest."
              : nullptr},
     };
-    for (int i = 0; i < 4; i++) {
+    const int nOpts = int(sizeof opts / sizeof opts[0]);
+    for (int i = 0; i < nOpts; i++) {
         if (i % cols) ImGui::SameLine(0, 10);
         if (card(fmt("##up%d", i).c_str(), opts[i].t, cw, ch, st.upscaler == opts[i].u, opts[i].enabled, opts[i].tip)) st.upscaler = opts[i].u;
     }
     ImGui::Dummy({0, 14});
 
-    ImGui::BeginDisabled(st.upscaler == Upscaler::Off);
-    label("Sharpness");
+    ImGui::BeginDisabled(st.upscaler == Upscaler::Anime4K);
+    label(st.upscaler == Upscaler::Off ? "Sharpness (AMD CAS)" : st.upscaler == Upscaler::NIS ? "Sharpness (NIS)" : "Sharpness");
     ImGui::SetNextItemWidth(std::min(360.f, avail));
     ImGui::PushFont(F().mono, 12);
     ImGui::SliderFloat("##sharp", &st.sharpness, 0.0f, 1.0f, "%.2f");
     ImGui::PopFont();
     ImGui::EndDisabled();
 
+    if (st.upscaler == Upscaler::Anime4K) {
+        ImGui::Dummy({0, 10});
+        label("Anime4K network size");
+        static const char* vs[] = {"S (fastest)", "M (balanced)", "L (best)"};
+        segmented("a4kv", vs, 3, &st.anime4kVariant);
+    }
+    if (st.upscaler == Upscaler::NIS || st.upscaler == Upscaler::Anime4K) {
+        ImGui::Dummy({0, 6});
+        ImGui::PushFont(F().regular, 13);
+        ImGui::Checkbox(fmt("Split view: FSR 1 left, %s right (C)", upscalerName(st.upscaler)).c_str(), &g->compareView);
+        ImGui::PopFont();
+    }
     auto& r = g->renderer;
     bool temporalSel = st.upscaler == Upscaler::FSR3 || st.upscaler == Upscaler::FSR4;
     if (temporalSel) {
@@ -724,22 +742,58 @@ void settingsUpscaling() {
     ImGui::PopFont();
     ImGui::EndDisabled();
     double fps = g->capture.isOpen() ? g->capture.fps : 60.0;
-    textColored(F().mono, 12, kMuted, fmt("FidelityFX frame interpolation · %.0f fps in, %.0f fps out (2×)", fps, fps * 2).c_str());
+    textColored(F().mono, 12, kMuted, fmt("%s · %.0f fps in, %.0f fps out (2×)", st.fgPredict ? "Motion prediction" : "FidelityFX frame interpolation",
+                                          fps, fps * 2).c_str());
+    ImGui::Dummy({0, 6});
+    ImGui::BeginDisabled(!fgAvail);
+    ImGui::PushFont(F().semibold, 13);
+    ImGui::Checkbox("Low-latency mode (predict)", &st.fgPredict);
+    ImGui::PopFont();
+    ImGui::EndDisabled();
+    textWrapped(F().regular, 12, kDim, "Shows each real frame the moment it arrives and predicts the next in-between frame from the motion so far, "
+                                       "instead of waiting for the next real frame. No added latency, but edges of moving objects can smear "
+                                       "and sudden stops or turns can overshoot for one frame.");
+    ImGui::Dummy({0, 8});
+    textColored(F().semibold, 13, kText, "Flow scale");
+    textWrapped(F().regular, 12, kDim, "Motion is tracked on a smaller copy of the frame. Lower is faster; small or thin moving things "
+                                       "(crosshairs, text, particles) may wobble more. Generated frames stay full resolution.");
+    {
+        const char* fs[] = {"Auto", "100%", "75%", "50%", "25%"};
+        const int vals[] = {0, 100, 75, 50, 25};
+        int fi = 0;
+        for (int k = 0; k < 5; k++) if (st.fgFlowScale == vals[k]) fi = k;
+        ImGui::BeginDisabled(!fgAvail);
+        if (segmented("flowscale", fs, 5, &fi)) st.fgFlowScale = vals[fi];
+        ImGui::EndDisabled();
+        if (st.frameGen && g->renderer.frameGenFlowW() > 0)
+            textColored(F().mono, 12, kMuted, fmt("Motion tracked at %u×%u", g->renderer.frameGenFlowW(), g->renderer.frameGenFlowH()).c_str());
+    }
+    ImGui::Dummy({0, 8});
     if (!fgAvail) textWrapped(F().regular, 12, kWarn, ("Unavailable: " + g->renderer.frameGenStatus).c_str());
     else if (st.frameGen && !g->renderer.frameGenStatus.empty()) textWrapped(F().regular, 12, kWarn, g->renderer.frameGenStatus.c_str());
     if (g->displayHz > 0 && g->displayHz + 1 < fps * 2)
         textWrapped(F().regular, 12, kWarn, fmt("This display refreshes at %.0f Hz, below %.0f fps, so some generated frames won't be seen. "
                                                 "Try a lower capture frame rate or a faster display.", g->displayHz, fps * 2).c_str());
     if (g->compareView || g->debugMotion) textWrapped(F().regular, 12, kDim, "Paused while split view or the motion debug view is on.");
-    textWrapped(F().regular, 12, kDim, "During very fast motion, where a generated frame would smear, the real frame is shown instead. "
-                                       "Unchanged pixels such as HUD text are kept from the real frame so they don't warp.");
+    if (st.fgPredict)
+        textWrapped(F().regular, 12, kDim, "Unchanged pixels such as HUD text are kept still so they don't warp.");
+    else
+        textWrapped(F().regular, 12, kDim, "During very fast motion, where a generated frame would smear, the real frame is shown instead. "
+                                           "Unchanged pixels such as HUD text are kept from the real frame so they don't warp.");
     if (st.frameGen && g->renderer.frameGenSkipped() > 0)
         textColored(F().mono, 12, kMuted, fmt("%llu generated frames skipped for fast motion so far", (unsigned long long)g->renderer.frameGenSkipped()).c_str());
     ImGui::Dummy({0, 10});
-    std::string body = fmt("Each generated frame sits between two real frames, so the real frame is held back by half a frame "
-                           "(%.1f ms at %.0f fps) plus the time to generate it (a few ms at 4K). Best left off for competitive play.",
-                           500.0 / std::max(1.0, fps), fps);
-    note(kWarnBg, kWarnBorder, kWarnText, kWarnBody, "Adds about half a frame of latency", body.c_str());
+    if (st.fgPredict) {
+        note(kWarnBg, kWarnBorder, kWarnText, kWarnBody, "No added latency",
+             "Real frames are shown as soon as they're captured; motion tracking runs after they're on screen. "
+             "Predicted frames are guesses, so expect more artifacts than the default mode.");
+    } else {
+        std::string body = fmt("Each generated frame sits between two real frames, so the real frame is held back by half a frame "
+                               "(%.1f ms at %.0f fps) plus the time to generate it (about 2 ms). Turn on low-latency mode, or leave "
+                               "frame generation off, for competitive play.",
+                               500.0 / std::max(1.0, fps), fps);
+        note(kWarnBg, kWarnBorder, kWarnText, kWarnBody, "Adds about half a frame of latency", body.c_str());
+    }
 }
 
 void settingsDisplay() {
@@ -839,7 +893,7 @@ void settingsShortcuts() {
     sectionTitle("Keyboard shortcuts");
     const char* rows[][2] = {{"F11 / F", "Toggle fullscreen"}, {"Tab", "Show or hide the stats overlay"}, {"S", "Settings"},
                              {"P", "Performance"}, {"D", "Choose capture device"}, {"M", "Mute audio"},
-                             {"U", "Cycle upscaler (Off / FSR 1 / FSR 3 / FSR 4)"}, {"F12", "Save a screenshot to Pictures/Lyvra"}, {"C", "Split view: FSR 1 | FSR 3"}, {"G", "Frame generation on/off"}, {"Esc", "Close panel / leave fullscreen"}, {"Ctrl+Q", "Quit"}};
+                             {"U", "Cycle upscaler (Native / FSR 1 / NIS / Anime4K / FSR 3 / FSR 4)"}, {"F12", "Save a screenshot to Pictures/Lyvra"}, {"C", "Split view: FSR 1 | FSR 3"}, {"G", "Frame generation on/off"}, {"Esc", "Close panel / leave fullscreen"}, {"Ctrl+Q", "Quit"}};
     if (ImGui::BeginTable("keys", 2, ImGuiTableFlags_RowBg | ImGuiTableFlags_PadOuterX)) {
         ImGui::TableSetupColumn("k", ImGuiTableColumnFlags_WidthFixed, 140);
         for (auto& r : rows) {
@@ -978,8 +1032,9 @@ void statsWindow() {
         text(dl, F().regular, 12, {p.x + 20 + measure(F().semibold, 15, "Latency breakdown").x + 10, p.y + 21}, kMuted,
              "From the capture timestamp to the frame being ready on the GPU. Compositor and display scanout come on top.");
         struct Seg { const char* name; float ms; uint32_t c; };
-        Seg segs[] = {{"USB transfer", s.transfer, 0x2E7D76}, {"Queue / FG hold", s.wait, 0x4A515C}, {"CPU + acquire", s.cpu, kAccent},
-                      {"GPU convert", s.gpuConvert, 0x3E9BD6}, {"GPU upscale + FG", s.gpuUpscale, 0xA8EDE6}, {"GPU composite", s.gpuComposite, kBlue}};
+        std::vector<Seg> segs = {{"USB transfer", s.transfer, 0x2E7D76}, {"Queue / FG hold", s.wait, 0x4A515C}, {"CPU + acquire", s.cpu, kAccent},
+                                 {"GPU convert", s.gpuConvert, 0x3E9BD6}, {"GPU upscale + FG", s.gpuUpscale, 0xA8EDE6}, {"GPU composite", s.gpuComposite, kBlue}};
+        if (g->capture.compressed()) segs.insert(segs.begin() + 1, {"MJPEG decode", s.decode, 0x8A6FD1});
         float total = 0;
         for (auto& sg : segs) total += std::max(0.f, sg.ms);
         float bx = p.x + 20, bw = avail - 40, by = p.y + 52;
@@ -993,9 +1048,10 @@ void statsWindow() {
         } else {
             dl->AddRectFilled({bx, by}, {bx + bw, by + 28}, col(kPanel2), 4);
         }
-        float lw = bw / 3;
-        for (int i = 0; i < 6; i++) {
-            float lx = bx + (i % 3) * lw, ly = by + 44 + (i / 3) * 24;
+        int lcols = (int(segs.size()) + 1) / 2;
+        float lw = bw / lcols;
+        for (int i = 0; i < int(segs.size()); i++) {
+            float lx = bx + (i % lcols) * lw, ly = by + 44 + (i / lcols) * 24;
             dl->AddRectFilled({lx, ly + 3}, {lx + 10, ly + 13}, col(segs[i].c), 2);
             text(dl, F().regular, 12, {lx + 18, ly}, kMuted, segs[i].name);
             std::string v = fmt("%.2f ms", segs[i].ms);
@@ -1043,7 +1099,7 @@ void statsWindow() {
         text(dl, F().semibold, 15, {p.x + 20, p.y + 18}, kText, "Signal path");
         auto& c = g->capture;
         std::string usb = usbSpeedFor(c.path);
-        double mbs = c.width * c.height * fourccBytesPerPixel(c.fourcc) * c.fps / 1e6;
+        double mbs = c.usbMBps();
         std::string rows[][2] = {
             {"Device", c.isOpen() ? c.name + " · " + c.path : "none"},
             {"Input", c.isOpen() ? fmt("%s @ %.0f · %s", res(c.width, c.height).c_str(), c.fps, fourccName(c.fourcc)) : "--"},
@@ -1262,10 +1318,15 @@ void shortcuts() {
     }
     if (ImGui::IsKeyPressed(ImGuiKey_U, false)) {
         Upscaler u = g->settings.upscaler;
-        if (u == Upscaler::Off) u = Upscaler::FSR1;
-        else if (u == Upscaler::FSR1) u = g->renderer.temporalAvailable() ? Upscaler::FSR3 : Upscaler::Off;
-        else if (u == Upscaler::FSR3) u = g->renderer.fsr4Available() ? Upscaler::FSR4 : Upscaler::Off;
-        else u = Upscaler::Off;
+        // Native -> FSR 1 -> NIS -> Anime4K -> FSR 3 -> FSR 4 -> Native, skipping unavailable ones
+        const Upscaler order[] = {Upscaler::Off, Upscaler::FSR1, Upscaler::NIS, Upscaler::Anime4K, Upscaler::FSR3, Upscaler::FSR4};
+        auto avail = [&](Upscaler x) {
+            return x == Upscaler::NIS ? g->renderer.nisAvailable() : x == Upscaler::Anime4K ? g->renderer.anime4kAvailable()
+                 : x == Upscaler::FSR3 ? g->renderer.temporalAvailable() : x == Upscaler::FSR4 ? g->renderer.fsr4Available() : true;
+        };
+        int idx = 0;
+        for (int k = 0; k < 6; k++) if (order[k] == u) idx = k;
+        for (int k = 1; k <= 6; k++) if (avail(order[(idx + k) % 6])) { u = order[(idx + k) % 6]; break; }
         g->settings.upscaler = u;
         g->showToast(std::string("Upscaling: ") + (u == Upscaler::Off ? "off" : upscalerName(u)));
     }
@@ -1277,8 +1338,9 @@ void shortcuts() {
     }
     if (ImGui::IsKeyPressed(ImGuiKey_C, false)) {
         g->compareView = !g->compareView;
-        if (g->compareView && g->settings.upscaler != Upscaler::FSR3 && g->renderer.temporalAvailable()) g->settings.upscaler = Upscaler::FSR3;
-        g->showToast(g->compareView ? "Split view: FSR 1 | FSR 3" : "Split view off");
+        Upscaler cu = g->settings.upscaler;
+        if (g->compareView && (cu == Upscaler::Off || cu == Upscaler::FSR1)) g->settings.upscaler = g->renderer.temporalAvailable() ? Upscaler::FSR3 : Upscaler::NIS;
+        g->showToast(g->compareView ? std::string("Split view: FSR 1 | ") + upscalerName(g->settings.upscaler) : std::string("Split view off"));
     }
     if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
         if (g->showPicker && g->capture.isOpen()) g->showPicker = false;

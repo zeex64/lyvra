@@ -18,7 +18,7 @@ struct Stats {
     int head = 0, count = 0;
 
     // Smoothed stage breakdown (ms)
-    float transfer = 0, wait = 0, cpu = 0, gpuConvert = 0, gpuUpscale = 0, gpuComposite = 0;
+    float transfer = 0, decode = 0, wait = 0, cpu = 0, gpuConvert = 0, gpuUpscale = 0, gpuComposite = 0;
     float latAvg = 0, latMin = 0, latP99 = 0;
     double shownFps = 0;
     uint64_t shownFrames = 0, lastShownNs = 0;

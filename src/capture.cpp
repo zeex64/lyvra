@@ -6,6 +6,7 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <turbojpeg.h>
 
 #include <algorithm>
 #include <cerrno>
@@ -36,22 +37,27 @@ const char* fourccName(uint32_t f) {
         case V4L2_PIX_FMT_NV12: return "NV12";
         case V4L2_PIX_FMT_YUYV: return "YUYV";
         case V4L2_PIX_FMT_YUV420: return "I420";
+        case V4L2_PIX_FMT_YUV422P: return "I422";
         case V4L2_PIX_FMT_MJPEG: return "MJPEG";
         default: return "?";
     }
 }
 
 bool fourccSupported(uint32_t f) {
-    return f == V4L2_PIX_FMT_NV12 || f == V4L2_PIX_FMT_YUYV || f == V4L2_PIX_FMT_YUV420;
+    return f == V4L2_PIX_FMT_NV12 || f == V4L2_PIX_FMT_YUYV || f == V4L2_PIX_FMT_YUV420 || f == V4L2_PIX_FMT_MJPEG;
 }
 
-double fourccBytesPerPixel(uint32_t f) { return f == V4L2_PIX_FMT_YUYV ? 2.0 : 1.5; }
+// Uncompressed bytes per pixel; 0 for MJPEG (size varies with picture content, measure it instead).
+double fourccBytesPerPixel(uint32_t f) {
+    return f == V4L2_PIX_FMT_MJPEG ? 0.0 : f == V4L2_PIX_FMT_YUYV ? 2.0 : 1.5;
+}
 
 static int fourccRank(uint32_t f) {  // lower = preferred (less USB bandwidth, simplest decode)
     switch (f) {
         case V4L2_PIX_FMT_NV12: return 0;
         case V4L2_PIX_FMT_YUV420: return 1;
         case V4L2_PIX_FMT_YUYV: return 2;
+        case V4L2_PIX_FMT_MJPEG: return 3;  // ~6x less USB traffic, but costs a CPU decode and is lossy
         default: return 9;
     }
 }
@@ -78,7 +84,11 @@ std::string DeviceInfo::summary() const {
     return s;
 }
 
-VideoMode pickBestMode(const std::vector<VideoMode>& modes) {
+VideoMode pickBestMode(const std::vector<VideoMode>& all) {
+    // Auto stays on uncompressed formats (lossless, no decode); MJPEG only if that's all the device offers.
+    std::vector<VideoMode> modes;
+    for (auto& m : all) if (m.fourcc != V4L2_PIX_FMT_MJPEG) modes.push_back(m);
+    if (modes.empty()) modes = all;
     // Prefer >=1080p if offered; then highest frame rate; then resolution; then cheapest format.
     bool has1080 = std::any_of(modes.begin(), modes.end(), [](auto& m) { return m.height >= 1080; });
     const VideoMode* best = nullptr;
@@ -173,7 +183,7 @@ std::vector<DeviceInfo> enumerateDevices() {
             }
         }
         ::close(fd);
-        if (d.modes.empty()) continue;  // metadata nodes, MJPEG-only devices
+        if (d.modes.empty()) continue;  // metadata nodes, devices with only unsupported formats
         std::stable_sort(d.modes.begin(), d.modes.end(), [](auto& a, auto& b) {
             if (a.width * a.height != b.width * b.height) return a.width * a.height > b.width * b.height;
             if (std::fabs(a.fps() - b.fps()) > 0.01) return a.fps() > b.fps();
@@ -209,8 +219,15 @@ bool Capture::open(const std::string& devPath, const VideoMode& mode, std::strin
     width = fmt.fmt.pix.width;
     height = fmt.fmt.pix.height;
     fourcc = fmt.fmt.pix.pixelformat;
-    stride = fmt.fmt.pix.bytesperline ? fmt.fmt.pix.bytesperline : width * (fourcc == V4L2_PIX_FMT_YUYV ? 2 : 1);
+    mjpeg_ = fourcc == V4L2_PIX_FMT_MJPEG;
+    if (mjpeg_) stride = width;  // of the decoded luma plane
+    else stride = fmt.fmt.pix.bytesperline ? fmt.fmt.pix.bytesperline : width * (fourcc == V4L2_PIX_FMT_YUYV ? 2 : 1);
     sizeImage = fmt.fmt.pix.sizeimage;
+    if (mjpeg_) {
+        tj_ = tjInitDecompress();
+        if (!tj_) { err = "Couldn't initialise the JPEG decoder"; close(); return false; }
+        for (auto& s : slots_) s.state = Slot::Free;
+    }
 
     v4l2_streamparm parm{};
     parm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
@@ -243,8 +260,10 @@ bool Capture::open(const std::string& devPath, const VideoMode& mode, std::strin
     v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     if (xioctl(fd_, VIDIOC_STREAMON, &type) < 0) { err = std::string("VIDIOC_STREAMON failed: ") + strerror(errno); close(); return false; }
 
-    framesCaptured = framesSkipped = framesLostByDriver = 0;
+    framesCaptured = framesSkipped = framesLostByDriver = framesCorrupt = 0;
     measuredFps = 0;
+    bytesPerFrame = 0;
+    decodeMs = 0;
     lastFrameNs = 0;
     pending_ = {};
     stop_ = false;
@@ -267,6 +286,9 @@ void Capture::close() {
         ::close(fd_);
         fd_ = -1;
     }
+    if (tj_) { tjDestroy(tj_); tj_ = nullptr; }
+    for (auto& s : slots_) { s.state = Slot::Free; s.data = {}; }
+    mjpeg_ = false;
     pending_ = {};
 }
 
@@ -282,12 +304,45 @@ bool Capture::acquireLatest(CaptureFrame& out) {
     std::lock_guard lk(mtx_);
     if (pending_.index < 0) return false;
     out = pending_;
+    if (mjpeg_) slots_[out.index].state = Slot::InApp;
     pending_ = {};
     return true;
 }
 
 void Capture::release(const CaptureFrame& f) {
-    if (f.index >= 0 && fd_ >= 0) queue(f.index);
+    if (f.index < 0 || fd_ < 0) return;
+    if (mjpeg_) {
+        std::lock_guard lk(mtx_);
+        slots_[f.index].state = Slot::Free;
+    } else {
+        queue(f.index);
+    }
+}
+
+// Decodes into slots_[f.index] as planar YUV at the JPEG's own chroma subsampling, which the
+// renderer converts on the GPU (no CPU colour conversion or chroma resampling).
+bool Capture::decodeJpeg(const uint8_t* jpeg, size_t len, CaptureFrame& f) {
+    tjhandle h = tj_;
+    // TurboJPEG 2 API: also in libjpeg-turbo 3.x, and still what Debian/Ubuntu ship.
+    int w = 0, ht = 0, ss = -1, cs = 0;
+    if (tjDecompressHeader3(h, jpeg, (unsigned long)len, &w, &ht, &ss, &cs) < 0) return false;
+    if (uint32_t(w) != width || uint32_t(ht) != height) return false;
+    uint32_t fc = ss == TJSAMP_420 ? V4L2_PIX_FMT_YUV420 : ss == TJSAMP_422 ? V4L2_PIX_FMT_YUV422P : 0;
+    if (!fc) {
+        failReason = "Unsupported MJPEG chroma subsampling (only 4:2:0 and 4:2:2 are handled)";
+        failed = true;
+        return false;
+    }
+    size_t need = tjBufSizeYUV2(w, 1, ht, ss);
+    auto& buf = slots_[f.index].data;
+    if (buf.size() < need) buf.resize(need);
+    // Warnings (e.g. a truncated frame) still produce a usable picture; only fatal errors drop it.
+    if (tjDecompressToYUV2(h, jpeg, (unsigned long)len, buf.data(), w, 1, ht, 0) < 0 && tjGetErrorCode(h) == TJERR_FATAL) return false;
+    f.data = buf.data();
+    f.bytes = need;
+    f.fourcc = fc;
+    f.stride = uint32_t(w);
+    return true;
 }
 
 void Capture::run() {
@@ -295,6 +350,36 @@ void Capture::run() {
     int head = 0, count = 0;
     uint32_t lastSeq = 0;
     bool haveSeq = false;
+
+    // Stats for every good frame the driver hands us, including ones skipped before decode.
+    auto account = [&](const v4l2_buffer& b, uint64_t deq) {
+        if (haveSeq && b.sequence > lastSeq + 1) framesLostByDriver += b.sequence - lastSeq - 1;
+        lastSeq = b.sequence;
+        haveSeq = true;
+        double used = b.bytesused ? b.bytesused : bufs_[b.index].len;
+        double prev = bytesPerFrame;
+        bytesPerFrame = prev == 0 ? used : prev * 0.95 + used * 0.05;
+
+        uint64_t ts = uint64_t(b.timestamp.tv_sec) * 1000000000ull + uint64_t(b.timestamp.tv_usec) * 1000ull;
+        if (ts == 0 || ts > deq) ts = deq;
+        // Frame rate and interval jitter over the last ~128 frames
+        times[head] = ts;
+        head = (head + 1) % 128;
+        if (count < 128) count++;
+        if (count >= 8) {
+            int n = count;
+            uint64_t newest = times[(head + 127) % 128], oldest = times[(head + 128 - n) % 128];
+            double span = double(newest - oldest) / 1e9;
+            if (span > 0) measuredFps = (n - 1) / span;
+            double mean = span / (n - 1), var = 0;
+            for (int i = 1; i < n; i++) {
+                double d = double(times[(head + 128 - n + i) % 128] - times[(head + 128 - n + i - 1) % 128]) / 1e9 - mean;
+                var += d * d;
+            }
+            intervalJitterMs = std::sqrt(var / (n - 1)) * 1000.0;
+        }
+        return ts;
+    };
 
     while (!stop_) {
         pollfd p{fd_, POLLIN, 0};
@@ -318,44 +403,71 @@ void Capture::run() {
         }
         uint64_t deq = nowNs();
         if (b.flags & V4L2_BUF_FLAG_ERROR) { queue(int(b.index)); continue; }
+        uint64_t ts = account(b, deq);
 
-        if (haveSeq && b.sequence > lastSeq + 1) framesLostByDriver += b.sequence - lastSeq - 1;
-        lastSeq = b.sequence;
-        haveSeq = true;
+        if (mjpeg_) {
+            // Decoding takes a few ms, so if a newer frame is already waiting, skip straight to it.
+            for (;;) {
+                v4l2_buffer nb{};
+                nb.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+                nb.memory = V4L2_MEMORY_MMAP;
+                if (xioctl(fd_, VIDIOC_DQBUF, &nb) < 0) break;  // EAGAIN: nothing newer
+                uint64_t ndeq = nowNs();
+                if (nb.flags & V4L2_BUF_FLAG_ERROR) { queue(int(nb.index)); continue; }
+                queue(int(b.index));
+                framesSkipped++;
+                framesCaptured++;
+                b = nb;
+                deq = ndeq;
+                ts = account(b, deq);
+            }
+        }
 
         CaptureFrame f;
-        f.index = int(b.index);
-        f.data = static_cast<const uint8_t*>(bufs_[b.index].ptr);
-        f.bytes = b.bytesused ? b.bytesused : bufs_[b.index].len;
-        f.timestampNs = uint64_t(b.timestamp.tv_sec) * 1000000000ull + uint64_t(b.timestamp.tv_usec) * 1000ull;
-        if (f.timestampNs == 0 || f.timestampNs > deq) f.timestampNs = deq;
+        f.timestampNs = ts;
         f.dequeueNs = deq;
         f.sequence = b.sequence;
 
-        {
+        if (mjpeg_) {
+            int slot = -1;
+            {
+                std::lock_guard lk(mtx_);
+                for (int i = 0; i < 3; i++)
+                    if (slots_[i].state == Slot::Free) { slot = i; break; }
+                if (slot >= 0) slots_[slot].state = Slot::Decoding;
+            }
+            if (slot < 0) { queue(int(b.index)); framesSkipped++; continue; }  // can't happen with 3 slots
+            f.index = slot;
+            size_t used = b.bytesused ? b.bytesused : bufs_[b.index].len;
+            bool ok = decodeJpeg(static_cast<const uint8_t*>(bufs_[b.index].ptr), used, f);
+            queue(int(b.index));
+            uint64_t done = nowNs();
+            if (!ok) {
+                framesCorrupt++;
+                std::lock_guard lk(mtx_);
+                slots_[slot].state = Slot::Free;
+                if (failed) { if (wake_) wake_(); break; }
+                continue;
+            }
+            f.decodeNs = done - deq;
+            double ms = double(f.decodeNs) / 1e6, prev = decodeMs;
+            decodeMs = prev == 0 ? ms : prev * 0.95 + ms * 0.05;
+            std::lock_guard lk(mtx_);
+            if (pending_.index >= 0) { slots_[pending_.index].state = Slot::Free; framesSkipped++; }
+            slots_[slot].state = Slot::Pending;
+            pending_ = f;
+        } else {
+            f.index = int(b.index);
+            f.data = static_cast<const uint8_t*>(bufs_[b.index].ptr);
+            f.bytes = b.bytesused ? b.bytesused : bufs_[b.index].len;
+            f.fourcc = fourcc;
+            f.stride = stride;
             std::lock_guard lk(mtx_);
             if (pending_.index >= 0) { queue(pending_.index); framesSkipped++; }
             pending_ = f;
         }
         framesCaptured++;
         lastFrameNs = deq;
-
-        // Frame rate and interval jitter over the last ~128 frames
-        times[head] = f.timestampNs;
-        head = (head + 1) % 128;
-        if (count < 128) count++;
-        if (count >= 8) {
-            int n = count;
-            uint64_t newest = times[(head + 127) % 128], oldest = times[(head + 128 - n) % 128];
-            double span = double(newest - oldest) / 1e9;
-            if (span > 0) measuredFps = (n - 1) / span;
-            double mean = span / (n - 1), var = 0;
-            for (int i = 1; i < n; i++) {
-                double d = double(times[(head + 128 - n + i) % 128] - times[(head + 128 - n + i - 1) % 128]) / 1e9 - mean;
-                var += d * d;
-            }
-            intervalJitterMs = std::sqrt(var / (n - 1)) * 1000.0;
-        }
         if (wake_) wake_();
     }
 }

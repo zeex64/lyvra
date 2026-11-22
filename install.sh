@@ -71,21 +71,24 @@ need pkg-config pkgconf
 need glslc shaderc
 need glslangValidator glslang
 need git git
+need python3 python
 pkg-config --exists sdl3 2>/dev/null && ok "SDL3" || { missing+=("sdl3"); warn "SDL3 development files not found"; }
+pkg-config --exists libturbojpeg 2>/dev/null && ok "libturbojpeg" || { missing+=("libjpeg-turbo"); warn "libturbojpeg development files not found"; }
 pkg-config --exists vulkan 2>/dev/null && ok "Vulkan loader" || { missing+=("vulkan-icd-loader"); warn "Vulkan loader not found"; }
 GENERATOR=()
 if command -v ninja >/dev/null 2>&1; then GENERATOR=(-G Ninja); ok "ninja"; else warn "ninja not found, using make (slower)"; fi
 if [ ${#missing[@]} -gt 0 ]; then
     echo
     echo "Install the missing packages first. On Arch / CachyOS:"
-    echo "  sudo pacman -S --needed cmake ninja pkgconf shaderc glslang git sdl3 vulkan-icd-loader"
+    echo "  sudo pacman -S --needed cmake ninja pkgconf shaderc glslang git python sdl3 libjpeg-turbo vulkan-icd-loader"
     echo "On Debian / Ubuntu (24.10+):"
-    echo "  sudo apt install cmake ninja-build pkg-config glslc glslang-tools git libsdl3-dev libvulkan-dev"
+    echo "  sudo apt install cmake ninja-build pkg-config glslc glslang-tools git python3 libsdl3-dev libturbojpeg0-dev libvulkan-dev"
     die "missing: ${missing[*]}"
 fi
 
 # Submodules (ImGui, Vulkan headers, FSR 1). Not --recursive: FSR 1's sample submodules aren't needed.
-if [ ! -f third_party/imgui/imgui.h ] || [ ! -f third_party/vulkan-headers/include/vulkan/vulkan.h ] || [ ! -f third_party/fsr1/ffx-fsr/ffx_fsr1.h ]; then
+if [ ! -f third_party/imgui/imgui.h ] || [ ! -f third_party/vulkan-headers/include/vulkan/vulkan.h ] || [ ! -f third_party/fsr1/ffx-fsr/ffx_fsr1.h ] \
+   || [ ! -f third_party/cas/ffx-cas/ffx_cas.h ] || [ ! -f third_party/nis/NIS/NIS_Scaler.h ]; then
     [ -d .git ] || die "third_party submodules are missing and this isn't a git checkout; clone the repo with git"
     bold "Fetching submodules"
     git submodule update --init --depth 1

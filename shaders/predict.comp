@@ -1,0 +1,38 @@
+#version 450
+// Predict mode: warps the last real (upscaled) frame forward along its motion to where things
+// will be half a capture frame later. Gather form: the output pixel p takes the colour from s
+// where s + amount * velocity(s) = p; a few fixed-point steps find s on smooth motion fields.
+// Catmull-Rom sampling keeps sub-pixel shifts from softening the frame.
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D realFrame;
+layout(binding = 1) uniform sampler2D predMotion;  // frame-gen px, current -> previous (= -velocity)
+layout(rgba8, binding = 2) writeonly uniform image2D outImg;
+layout(push_constant) uniform PC { uint width; uint height; float fgW; float fgH; float amount; } pc;
+
+vec3 catmullRom(vec2 uv) {
+    vec2 size = vec2(textureSize(realFrame, 0));
+    vec2 pos = uv * size;
+    vec2 c = floor(pos - 0.5) + 0.5;
+    vec2 f = pos - c;
+    vec2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f));
+    vec2 w1 = 1.0 + f * f * (-2.5 + 1.5 * f);
+    vec2 w2 = f * (0.5 + f * (2.0 - 1.5 * f));
+    vec2 w3 = f * f * (-0.5 + 0.5 * f);
+    vec2 w12 = w1 + w2;
+    vec2 t0 = (c - 1.0) / size, t3 = (c + 2.0) / size, t12 = (c + w2 / w12) / size;
+    vec3 r = (texture(realFrame, vec2(t0.x, t0.y)).rgb * w0.x + texture(realFrame, vec2(t12.x, t0.y)).rgb * w12.x + texture(realFrame, vec2(t3.x, t0.y)).rgb * w3.x) * w0.y
+           + (texture(realFrame, vec2(t0.x, t12.y)).rgb * w0.x + texture(realFrame, vec2(t12.x, t12.y)).rgb * w12.x + texture(realFrame, vec2(t3.x, t12.y)).rgb * w3.x) * w12.y
+           + (texture(realFrame, vec2(t0.x, t3.y)).rgb * w0.x + texture(realFrame, vec2(t12.x, t3.y)).rgb * w12.x + texture(realFrame, vec2(t3.x, t3.y)).rgb * w3.x) * w3.y;
+    return clamp(r, 0.0, 1.0);
+}
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= int(pc.width) || p.y >= int(pc.height)) return;
+    vec2 uv = (vec2(p) + 0.5) / vec2(pc.width, pc.height);
+    vec2 toUv = pc.amount / vec2(pc.fgW, pc.fgH);
+    vec2 s = uv;
+    for (int i = 0; i < 3; i++) s = uv + texture(predMotion, s).xy * toUv;
+    vec3 c = s == uv ? texture(realFrame, uv).rgb : catmullRom(s);
+    imageStore(outImg, p, vec4(c, 1.0));
+}

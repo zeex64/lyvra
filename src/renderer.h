@@ -9,6 +9,7 @@
 #include "settings.h"
 #include "temporal.h"
 #include "framegen.h"
+#include "anime4k.h"
 
 struct ImDrawData;
 
@@ -33,6 +34,10 @@ struct RenderParams {
     bool frameGen = false;      // on a new frame, present a generated in-between frame instead
     bool fgLock = true;         // static-pixel lock for frame generation
     int fsrQuality = 0;         // FSR 3/4 output: 0 Auto (window), 1 Native AA, 2 Quality, 3 Balanced, 4 Performance, 5 Ultra Performance
+    int anime4kVariant = 1;     // 0 S, 1 M, 2 L
+    bool fgPredict = false;     // frame gen predict mode: real frames shown at once, a predicted frame half a frame later
+    bool predictFrame = false;  // (no input) present the predicted frame for the last real frame now
+    int fgFlowScale = 0;        // optical flow resolution in %, 0 = auto
 };
 
 struct GpuTimes { float convert = 0, upscale = 0, present = 0, total = 0; bool valid = false; };
@@ -61,6 +66,7 @@ public:
     uint32_t inW = 0, inH = 0, outW = 0, outH = 0;
     uint32_t swapW = 0, swapH = 0;
     GpuTimes gpu;
+    GpuTimes gpuWork;  // last timings from a frame that processed a new capture frame
     uint64_t lastRenderStartNs = 0, lastSubmitNs = 0, lastPresentReturnNs = 0;
     bool hasInput() const { return inputValid_; }
     bool temporalAvailable() const { return temporal_.available(); }
@@ -70,9 +76,15 @@ public:
     bool showingMotion = false;
     bool comparing = false;  // split view active this frame
     bool frameGenAvailable() const { return fg_.available(); }
+    bool nisAvailable() const { return nisPipe_ != VK_NULL_HANDLE && coefScale_.image; }
+    bool anime4kAvailable() const { return a4k_.available(); }
     uint64_t frameGenSkipped() const { return fg_.skippedFrames; }
     float frameGenFailedFraction() const { return fg_.lastFailedFraction; }
     bool generatedShown = false;  // this render presented a generated frame; the real one is still to come
+    bool predictedShown = false;  // this render presented a predicted frame (predict mode)
+    bool predictReady() const { return predictReady_; }  // a predicted frame can be shown for the last real one
+    uint32_t frameGenFlowW() const { return fg_.flowWidth(); }
+    uint32_t frameGenFlowH() const { return fg_.flowHeight(); }
     std::string frameGenStatus;
     Rect lastDst;            // where the video was drawn, in pixels
 
@@ -81,10 +93,12 @@ private:
     struct Buffer { VkBuffer buf = VK_NULL_HANDLE; VkDeviceMemory mem = VK_NULL_HANDLE; void* map = nullptr; VkDeviceSize size = 0; };
     struct Frame {
         VkCommandBuffer cmd = VK_NULL_HANDLE;
+        VkCommandBuffer cmdAfter = VK_NULL_HANDLE;  // work submitted after present (predict-mode motion)
         VkFence fence = VK_NULL_HANDLE;
         VkSemaphore acquired = VK_NULL_HANDLE;
         Buffer staging;
         bool queried = false;
+        bool hadInput = false;  // this submission processed a new capture frame
     };
     static constexpr int kFrames = 2;
 
@@ -93,7 +107,9 @@ private:
     bool createPipelines();
     VkShaderModule shader(const uint32_t* code, size_t bytes);
     uint32_t memType(uint32_t bits, VkMemoryPropertyFlags want, VkMemoryPropertyFlags fallback);
-    bool createImage(Image& img, uint32_t w, uint32_t h);
+    bool createImage(Image& img, uint32_t w, uint32_t h, VkFormat fmt = VK_FORMAT_R8G8B8A8_UNORM,
+                     VkImageUsageFlags usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
+    bool uploadNisCoefficients();
     void destroyImage(Image& img);
     bool createBuffer(Buffer& b, VkDeviceSize size);
     void destroyBuffer(Buffer& b);
@@ -131,6 +147,11 @@ private:
     int cur_ = 0;
 
     Image src_, easu_, rcas_, easuG_, rcasG_;  // *G_: FSR 1 on generated frames
+    Image cas_, casG_;            // CAS native sharpening (real / generated frames)
+    Image nis_, nisG_, coefScale_, coefUsm_;
+    Image pred_;                  // predict mode output (window size)
+    bool predictReady_ = false, lastPredict_ = false;
+    bool spatialDirty_ = true;     // CAS/NIS need to re-run without a new frame
     uint32_t inFourcc_ = 0;
     size_t stagingSize_ = 0;
     bool inputValid_ = false, upscaleDirty_ = true;
@@ -140,10 +161,17 @@ private:
     VkDescriptorSetLayout yuvSetLayout_ = VK_NULL_HANDLE, fsrSetLayout_ = VK_NULL_HANDLE, blitSetLayout_ = VK_NULL_HANDLE;
     VkPipelineLayout yuvLayout_ = VK_NULL_HANDLE, fsrLayout_ = VK_NULL_HANDLE, blitLayout_ = VK_NULL_HANDLE;
     VkPipeline yuvPipe_ = VK_NULL_HANDLE, easuPipe_ = VK_NULL_HANDLE, rcasPipe_ = VK_NULL_HANDLE, blitPipe_ = VK_NULL_HANDLE;
+    VkPipeline casPipe_ = VK_NULL_HANDLE, nisPipe_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout nisSetLayout_ = VK_NULL_HANDLE;
+    VkPipelineLayout nisLayout_ = VK_NULL_HANDLE;
+    VkPipeline predPipe_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout predSetLayout_ = VK_NULL_HANDLE;
+    VkPipelineLayout predLayout_ = VK_NULL_HANDLE;
 
     bool imguiReady_ = false;
     Temporal temporal_;
     FrameGen fg_;
+    Anime4K a4k_;
     bool temporalInputFresh_ = false;
     std::string screenshotPath_;
     Buffer readback_;

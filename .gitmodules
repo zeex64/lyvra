@@ -7,3 +7,9 @@
 [submodule "third_party/fsr1"]
 	path = third_party/fsr1
 	url = https://github.com/GPUOpen-Effects/FidelityFX-FSR.git
+[submodule "third_party/cas"]
+	path = third_party/cas
+	url = https://github.com/GPUOpen-Effects/FidelityFX-CAS.git
+[submodule "third_party/nis"]
+	path = third_party/nis
+	url = https://github.com/NVIDIAGameWorks/NVIDIAImageScaling.git

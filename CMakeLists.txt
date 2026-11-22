@@ -10,6 +10,7 @@ endif()
 
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(SDL3 REQUIRED IMPORTED_TARGET sdl3)
+pkg_check_modules(TURBOJPEG REQUIRED IMPORTED_TARGET libturbojpeg>=2.0)  # MJPEG capture decode
 pkg_check_modules(VULKAN REQUIRED vulkan)
 # Headers are vendored (third_party/vulkan-headers) so only the loader is needed on the system.
 add_library(vulkan_iface INTERFACE)
@@ -18,6 +19,7 @@ target_link_libraries(vulkan_iface INTERFACE ${VULKAN_LINK_LIBRARIES})
 find_package(Threads REQUIRED)
 include(GNUInstallDirs)
 find_program(GLSLC glslc REQUIRED)
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
 # ---- Dear ImGui -------------------------------------------------------------
 set(IMGUI_DIR ${CMAKE_SOURCE_DIR}/third_party/imgui)
@@ -32,20 +34,33 @@ include(cmake/fidelityfx.cmake)
 
 # ---- Shaders -> embedded SPIR-V ---------------------------------------------
 set(FSR1_DIR ${CMAKE_SOURCE_DIR}/third_party/fsr1/ffx-fsr)
-set(SHADER_SRC yuv.comp easu.comp rcas.comp blit.vert blit.frag motion.comp jitter.comp jitter16.comp fgmotion.comp fglock.comp fgcheck.comp)
+set(CAS_DIR ${CMAKE_SOURCE_DIR}/third_party/cas/ffx-cas)
+set(NIS_DIR ${CMAKE_SOURCE_DIR}/third_party/nis/NIS)
+set(SHADER_SRC yuv.comp easu.comp rcas.comp blit.vert blit.frag motion.comp jitter.comp jitter16.comp fgmotion.comp fglock.comp fgcheck.comp fgpredmv.comp predict.comp cas.comp nis.comp)
 set(SHADER_OUT_DIR ${CMAKE_BINARY_DIR}/shaders)
 file(MAKE_DIRECTORY ${SHADER_OUT_DIR})
 foreach(s ${SHADER_SRC})
   set(out ${SHADER_OUT_DIR}/${s}.inc)
   add_custom_command(
     OUTPUT ${out}
-    COMMAND ${GLSLC} -O --target-env=vulkan1.3 -I${FSR1_DIR} -MD -MF ${out}.d -mfmt=c
+    COMMAND ${GLSLC} -O --target-env=vulkan1.3 -I${FSR1_DIR} -I${CAS_DIR} -I${NIS_DIR} -MD -MF ${out}.d -mfmt=c
             -o ${out} ${CMAKE_SOURCE_DIR}/shaders/${s}
     DEPENDS ${CMAKE_SOURCE_DIR}/shaders/${s}
     DEPFILE ${out}.d
     COMMENT "glslc ${s}")
   list(APPEND SHADER_OUTS ${out})
 endforeach()
+# Anime4K: mpv user shaders -> one compute shader per pass, embedded as SPIR-V
+set(A4K_DIR ${CMAKE_SOURCE_DIR}/third_party/anime4k)
+set(A4K_HEADER ${SHADER_OUT_DIR}/anime4k_passes.h)
+add_custom_command(
+  OUTPUT ${A4K_HEADER}
+  COMMAND ${Python3_EXECUTABLE} -I ${CMAKE_SOURCE_DIR}/tools/gen_anime4k.py --glslc ${GLSLC} --out ${A4K_HEADER}
+          S=${A4K_DIR}/Anime4K_Upscale_CNN_x2_S.glsl M=${A4K_DIR}/Anime4K_Upscale_CNN_x2_M.glsl L=${A4K_DIR}/Anime4K_Upscale_CNN_x2_L.glsl
+  DEPENDS ${CMAKE_SOURCE_DIR}/tools/gen_anime4k.py ${A4K_DIR}/Anime4K_Upscale_CNN_x2_S.glsl
+          ${A4K_DIR}/Anime4K_Upscale_CNN_x2_M.glsl ${A4K_DIR}/Anime4K_Upscale_CNN_x2_L.glsl
+  COMMENT "Converting Anime4K shaders")
+list(APPEND SHADER_OUTS ${A4K_HEADER})
 add_custom_target(lyvra_shaders DEPENDS ${SHADER_OUTS})
 
 # ---- Fonts -> embedded byte arrays ------------------------------------------
@@ -76,14 +91,14 @@ add_custom_command(
 # ---- App --------------------------------------------------------------------
 add_executable(lyvra
   src/main.cpp src/capture.cpp src/renderer.cpp src/ui.cpp src/audio.cpp
-  src/settings.cpp src/fsr1_constants.cpp src/temporal.cpp src/framegen.cpp ${FONTS_CPP} ${ICON_CPP})
+  src/settings.cpp src/fsr1_constants.cpp src/temporal.cpp src/framegen.cpp src/anime4k.cpp src/nis_support.cpp ${FONTS_CPP} ${ICON_CPP})
 add_dependencies(lyvra lyvra_shaders)
 target_include_directories(lyvra PRIVATE src ${SHADER_OUT_DIR})
 # Third-party headers as SYSTEM so their warnings don't drown ours.
-target_include_directories(lyvra SYSTEM PRIVATE ${FSR1_DIR}
+target_include_directories(lyvra SYSTEM PRIVATE ${FSR1_DIR} ${CAS_DIR} ${NIS_DIR}
   ${CMAKE_SOURCE_DIR}/third_party/ffx-api/api/include ${CMAKE_SOURCE_DIR}/third_party/ffx-api/upscalers/include)
 target_compile_options(lyvra PRIVATE -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers)
-target_link_libraries(lyvra PRIVATE ffx_sdk imgui PkgConfig::SDL3 vulkan_iface Threads::Threads ${CMAKE_DL_LIBS})
+target_link_libraries(lyvra PRIVATE ffx_sdk imgui PkgConfig::SDL3 PkgConfig::TURBOJPEG vulkan_iface Threads::Threads ${CMAKE_DL_LIBS})
 
 # FSR 4: fsr4-vk (GPL-3.0, third_party/fsr4-vk) builds amd_fidelityfx_upscaler_vk.so, which Lyvra loads
 # at runtime through the FFX API. Point this at a built copy to place it next to the binary.

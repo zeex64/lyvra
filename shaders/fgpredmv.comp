@@ -1,0 +1,51 @@
+#version 450
+// Predict mode (low-latency frame generation): turns this frame's motion field into the one the
+// predicted frame is warped with, and stores this frame for the next optical flow.
+// Each vector is checked against the frames: if the previous frame, sampled where the vector says
+// this pixel came from, doesn't match the pixel, the vector is wrong for it (HUD text and
+// crosshairs over a moving scene, scene cuts, flow errors) and the pixel is kept still. Leading
+// edges of moving objects pass the check, so they still move. Vectors must also roughly agree with
+// the motion found there one frame earlier: repeating patterns (fences, tiles, rings) can fool the
+// first check with a vector one pattern period off, but such matches don't persist. Very large
+// vectors are clamped.
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D cur;
+layout(binding = 1) uniform sampler2D prev;    // linear
+layout(binding = 2) uniform sampler2D motion;  // frame px, current -> previous
+layout(rg16f, binding = 3) writeonly uniform image2D predMotion;
+layout(rgba8, binding = 4) writeonly uniform image2D store;
+layout(binding = 5) uniform sampler2D histPrev;            // last frame's raw motion (linear)
+layout(rg16f, binding = 6) writeonly uniform image2D histOut;
+layout(push_constant) uniform PC { uint width; uint height; uint havePrev; uint check; float maxPx; uint haveHist; } pc;
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= int(pc.width) || p.y >= int(pc.height)) return;
+    vec3 c = texelFetch(cur, p, 0).rgb;
+    imageStore(store, p, vec4(c, 1.0));
+    vec2 m = pc.havePrev != 0u ? texelFetch(motion, p, 0).xy : vec2(0.0);
+    imageStore(histOut, p, vec4(m, 0.0, 0.0));
+    if (pc.havePrev != 0u && pc.check != 0u && dot(m, m) > 0.0) {
+        vec2 sz = vec2(pc.width, pc.height);
+        vec2 q = (vec2(p) + 0.5 + m) / sz;
+        float e = 1.0;
+        for (int y = -1; y <= 1; y++)  // allow half a pixel of slack for sub-pixel flow error
+            for (int x = -1; x <= 1; x++) {
+                vec3 d = abs(texture(prev, q + vec2(x, y) * 0.5 / sz).rgb - c);
+                e = min(e, max(d.r, max(d.g, d.b)));
+            }
+        m *= 1.0 - smoothstep(0.05, 0.15, e);
+        // Temporal consistency, looked up where this pixel was in the previous frame.
+        float len = length(m);
+        if (pc.haveHist != 0u) {
+            vec2 mp = texture(histPrev, (vec2(p) + 0.5 + m) / sz).xy;
+            float dv = length(m - mp);
+            m *= 1.0 - smoothstep(1.5 + 0.35 * len, 3.0 + 0.7 * len, dv);
+        } else {
+            m = vec2(0.0);  // no history yet (first frame, reset): don't guess
+        }
+    }
+    float len = length(m);
+    if (len > pc.maxPx) m *= pc.maxPx / len;
+    imageStore(predMotion, p, vec4(m, 0.0, 0.0));
+}

@@ -1,6 +1,6 @@
 #version 450
 // Converts a raw V4L2 frame (read straight from a host-visible buffer) to RGBA8.
-// Formats: 0 = NV12, 1 = YUYV, 2 = I420 (YU12).
+// Formats: 0 = NV12, 1 = YUYV, 2 = I420 (YU12), 3 = I422 (planar 4:2:2, from MJPEG decode).
 layout(local_size_x = 16, local_size_y = 16) in;
 
 layout(std430, binding = 0) readonly buffer Src { uint data[]; };
@@ -11,8 +11,8 @@ layout(push_constant) uniform PC {
     uint height;
     uint stride;     // bytes per luma line
     uint format;
-    uint uOffset;    // NV12: UV plane offset, I420: U plane offset
-    uint vOffset;    // I420: V plane offset
+    uint uOffset;    // NV12: UV plane offset, I420/I422: U plane offset
+    uint vOffset;    // I420/I422: V plane offset
     uint fullRange;  // 0 = limited (16-235), 1 = full
     uint bt601;      // 0 = BT.709, 1 = BT.601
 } pc;
@@ -37,7 +37,8 @@ void main() {
     } else {
         y = float(byteAt(p.y * pc.stride + p.x));
         uint cs = pc.stride >> 1;
-        uint c = (p.y >> 1) * cs + (p.x >> 1);
+        uint cy = pc.format == 3u ? p.y : (p.y >> 1);  // I422 keeps full vertical chroma
+        uint c = cy * cs + (p.x >> 1);
         u = float(byteAt(pc.uOffset + c));
         v = float(byteAt(pc.vOffset + c));
     }

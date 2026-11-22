@@ -38,7 +38,7 @@ void Settings::load() {
 
     s("device", devicePath); u("fourcc", fourcc); u("width", width); u("height", height);
     u("fps_num", fpsNum); u("fps_den", fpsDen); e("matrix", matrix); e("range", range);
-    e("upscaler", upscaler); fl("sharpness", sharpness); i("fsr_quality", fsrQuality); b("frame_gen", frameGen);
+    e("upscaler", upscaler); fl("sharpness", sharpness); i("fsr_quality", fsrQuality); i("anime4k_variant", anime4kVariant); b("frame_gen", frameGen); b("fg_predict", fgPredict); i("fg_flow_scale", fgFlowScale);
     e("present", present); e("scale", scale); b("start_fullscreen", startFullscreen);
     b("bars_in_fullscreen", barsInFullscreen);
     b("audio", audioEnabled); s("audio_input", audioInput); s("audio_output", audioOutput);
@@ -54,7 +54,7 @@ void Settings::save() const {
     f << "# " APP_NAME " settings\n"
       << "device=" << devicePath << "\nfourcc=" << fourcc << "\nwidth=" << width << "\nheight=" << height
       << "\nfps_num=" << fpsNum << "\nfps_den=" << fpsDen << "\nmatrix=" << (int)matrix << "\nrange=" << (int)range
-      << "\nupscaler=" << (int)upscaler << "\nsharpness=" << sharpness << "\nfsr_quality=" << fsrQuality << "\nframe_gen=" << frameGen
+      << "\nupscaler=" << (int)upscaler << "\nsharpness=" << sharpness << "\nfsr_quality=" << fsrQuality << "\nanime4k_variant=" << anime4kVariant << "\nframe_gen=" << frameGen << "\nfg_predict=" << fgPredict << "\nfg_flow_scale=" << fgFlowScale
       << "\npresent=" << (int)present << "\nscale=" << (int)scale << "\nstart_fullscreen=" << startFullscreen
       << "\nbars_in_fullscreen=" << barsInFullscreen
       << "\naudio=" << audioEnabled << "\naudio_input=" << audioInput << "\naudio_output=" << audioOutput
