@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Lyvra
+GenericName=Capture Card Viewer
+Comment=Low-latency capture card viewer with FSR 1/3/4 upscaling and frame generation
+Exec=lyvra
+Icon=lyvra
+Terminal=false
+Categories=AudioVideo;Video;Player;
+Keywords=capture;hdmi;v4l2;viewer;latency;

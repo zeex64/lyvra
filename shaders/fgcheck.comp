@@ -1,0 +1,28 @@
+#version 450
+// Frame generation guard: counts sampled pixels whose motion vector fails to explain the
+// change from the previous real frame (previous frame warped by the vector doesn't match).
+// If too many fail (fast pans, cuts), the lock pass shows the real frame instead.
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D cur;
+layout(binding = 1) uniform sampler2D prev;
+layout(binding = 2) uniform sampler2D motion;   // display-res pixels, current -> previous
+layout(std430, binding = 3) buffer Counter { uint sampled; uint failed; uint fast; } counter;
+layout(push_constant) uniform PC { uint width; uint height; uint step; float fastPx; } pc;
+
+float luma(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
+
+void main() {
+    uvec2 p = gl_GlobalInvocationID.xy * pc.step + pc.step / 2;
+    if (p.x >= pc.width || p.y >= pc.height) return;
+    vec2 size = vec2(pc.width, pc.height);
+    vec2 uv = (vec2(p) + 0.5) / size;
+    vec2 v = texture(motion, uv).xy;
+    float lc = luma(texture(cur, uv).rgb);
+    float warped = abs(lc - luma(texture(prev, uv + v / size).rgb));
+    float still = abs(lc - luma(texture(prev, uv).rgb));
+    // A pixel "fails" if neither the vector nor standing still explains it.
+    bool fail = min(warped, still) > 0.12;
+    atomicAdd(counter.sampled, 1u);
+    if (fail) atomicAdd(counter.failed, 1u);
+    if (dot(v, v) > pc.fastPx * pc.fastPx) atomicAdd(counter.fast, 1u);
+}

@@ -1,0 +1,80 @@
+#version 450
+// Expands FidelityFX optical flow (one int16 pixel vector per block, pointing from the
+// current pixel to its position in the previous frame) into a per-pixel motion vector
+// texture for the FSR 3 upscaler, and optionally a colour-coded debug view.
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform isampler2D flow;          // R16G16_SINT, ceil(w/block) x ceil(h/block)
+layout(rg16f, binding = 1) writeonly uniform image2D motion;  // render resolution, pixels
+layout(rgba8, binding = 2) writeonly uniform image2D debugView;
+layout(binding = 3) uniform sampler2D curColor;                 // this frame (render res)
+layout(binding = 4) uniform sampler2D prevColor;                // last frame's copy
+layout(rgba8, binding = 5) writeonly uniform image2D colorCopy;  // becomes next frame's prevColor
+layout(r8, binding = 6) writeonly uniform image2D reactive;      // FSR reactive mask
+
+layout(push_constant) uniform PC {
+    uint width;
+    uint height;
+    uint blockSize;
+    uint writeDebug;
+    float debugScale;  // pixels of motion that map to full saturation
+    uint havePrev;
+} pc;
+
+float luma(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
+
+vec2 fetchFlow(ivec2 b) {
+    ivec2 sz = textureSize(flow, 0);
+    vec2 v = vec2(texelFetch(flow, clamp(b, ivec2(0), sz - 1), 0).xy);
+    // Optical flow jitters by about a pixel on flat or dark content. Treat that as static so
+    // FSR doesn't reproject still text and HUDs by tiny amounts (that shows up as shimmer).
+    return dot(v, v) <= 1.0 ? vec2(0.0) : v;
+}
+
+vec3 hsv2rgb(vec3 c) {
+    vec3 p = abs(fract(c.xxx + vec3(0.0, 2.0 / 3.0, 1.0 / 3.0)) * 6.0 - 3.0);
+    return c.z * mix(vec3(1.0), clamp(p - 1.0, 0.0, 1.0), c.y);
+}
+
+void main() {
+    uvec2 p = gl_GlobalInvocationID.xy;
+    if (p.x >= pc.width || p.y >= pc.height) return;
+
+    // Bilinear between the four nearest block centres.
+    vec2 fb = (vec2(p) + 0.5) / float(pc.blockSize) - 0.5;
+    ivec2 b0 = ivec2(floor(fb));
+    vec2 t = fb - vec2(b0);
+    vec2 v = mix(mix(fetchFlow(b0), fetchFlow(b0 + ivec2(1, 0)), t.x),
+                 mix(fetchFlow(b0 + ivec2(0, 1)), fetchFlow(b0 + ivec2(1, 1)), t.x), t.y);
+
+    imageStore(motion, ivec2(p), vec4(v, 0.0, 0.0));
+
+    // Reactive mask: if last frame warped by this vector doesn't match this frame, the vector is
+    // wrong (repetitive textures, particles, transparency, cuts). Tell FSR to trust the current frame.
+    vec2 size = vec2(pc.width, pc.height);
+    vec2 uv = (vec2(p) + 0.5) / size;
+    vec3 cur = texture(curColor, uv).rgb;
+    float r = 0.0;
+    if (pc.havePrev != 0u) {
+        vec2 puv = uv + v / size;
+        float lc = luma(cur);
+        float warped = abs(lc - luma(texture(prevColor, puv).rgb));
+        // Ignore differences the zero-motion frame also has (noise, dithering): only blame the vector.
+        float still = abs(lc - luma(texture(prevColor, uv).rgb));
+        float e = (dot(v, v) > 0.0) ? warped : min(warped, still);
+        bool outside = any(lessThan(puv, vec2(0.0))) || any(greaterThan(puv, vec2(1.0)));
+        r = outside ? 1.0 : smoothstep(0.06, 0.25, e);
+    }
+    imageStore(reactive, ivec2(p), vec4(r));
+    imageStore(colorCopy, ivec2(p), vec4(cur, 1.0));
+
+    if (pc.writeDebug != 0u) {
+        float mag = length(v);
+        float hue = atan(v.y, v.x) / 6.2831853 + 0.5;
+        vec3 c = hsv2rgb(vec3(hue, clamp(mag / pc.debugScale, 0.0, 1.0), 1.0));
+        c *= mag < 0.5 ? 0.15 : 1.0;  // static areas go dark
+        // Unreliable vectors (FSR told to trust the current frame): black/white checker.
+        if (r > 0.5) c = (((p.x >> 2) ^ (p.y >> 2)) & 1u) != 0u ? vec3(1.0) : vec3(0.0);
+        imageStore(debugView, ivec2(p), vec4(c, 1.0));
+    }
+}

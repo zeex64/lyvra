@@ -1,0 +1,59 @@
+#version 450
+// Converts a raw V4L2 frame (read straight from a host-visible buffer) to RGBA8.
+// Formats: 0 = NV12, 1 = YUYV, 2 = I420 (YU12).
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(std430, binding = 0) readonly buffer Src { uint data[]; };
+layout(rgba8, binding = 1) writeonly uniform image2D dst;
+
+layout(push_constant) uniform PC {
+    uint width;
+    uint height;
+    uint stride;     // bytes per luma line
+    uint format;
+    uint uOffset;    // NV12: UV plane offset, I420: U plane offset
+    uint vOffset;    // I420: V plane offset
+    uint fullRange;  // 0 = limited (16-235), 1 = full
+    uint bt601;      // 0 = BT.709, 1 = BT.601
+} pc;
+
+uint byteAt(uint off) { return (data[off >> 2] >> ((off & 3u) * 8u)) & 0xFFu; }
+
+void main() {
+    uvec2 p = gl_GlobalInvocationID.xy;
+    if (p.x >= pc.width || p.y >= pc.height) return;
+
+    float y, u, v;
+    if (pc.format == 0u) {
+        y = float(byteAt(p.y * pc.stride + p.x));
+        uint c = pc.uOffset + (p.y >> 1) * pc.stride + (p.x & ~1u);
+        u = float(byteAt(c));
+        v = float(byteAt(c + 1u));
+    } else if (pc.format == 1u) {
+        uint base = p.y * pc.stride + (p.x >> 1) * 4u;
+        y = float(byteAt(base + ((p.x & 1u) * 2u)));
+        u = float(byteAt(base + 1u));
+        v = float(byteAt(base + 3u));
+    } else {
+        y = float(byteAt(p.y * pc.stride + p.x));
+        uint cs = pc.stride >> 1;
+        uint c = (p.y >> 1) * cs + (p.x >> 1);
+        u = float(byteAt(pc.uOffset + c));
+        v = float(byteAt(pc.vOffset + c));
+    }
+
+    float Y, Cb, Cr;
+    if (pc.fullRange == 1u) {
+        Y = y / 255.0; Cb = (u - 128.0) / 255.0; Cr = (v - 128.0) / 255.0;
+    } else {
+        Y = (y - 16.0) / 219.0; Cb = (u - 128.0) / 224.0; Cr = (v - 128.0) / 224.0;
+    }
+
+    vec3 rgb;
+    if (pc.bt601 == 1u) {
+        rgb = vec3(Y + 1.402 * Cr, Y - 0.344136 * Cb - 0.714136 * Cr, Y + 1.772 * Cb);
+    } else {
+        rgb = vec3(Y + 1.5748 * Cr, Y - 0.187324 * Cb - 0.468124 * Cr, Y + 1.8556 * Cb);
+    }
+    imageStore(dst, ivec2(p), vec4(clamp(rgb, 0.0, 1.0), 1.0));
+}

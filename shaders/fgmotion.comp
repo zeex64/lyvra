@@ -1,0 +1,24 @@
+#version 450
+// Frame generation: expands block optical flow (int16 pixel vectors, current -> previous)
+// into a per-pixel motion vector field at display resolution for FidelityFX FI.
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform isampler2D flow;
+layout(rg16f, binding = 1) writeonly uniform image2D motion;
+layout(push_constant) uniform PC { uint width; uint height; uint blockSize; uint flowScale; } pc;  // flowScale: display px per flow px
+
+vec2 fetchFlow(ivec2 b) {
+    ivec2 sz = textureSize(flow, 0);
+    vec2 v = vec2(texelFetch(flow, clamp(b, ivec2(0), sz - 1), 0).xy);
+    return dot(v, v) <= 1.0 ? vec2(0.0) : v;  // ignore +-1 px noise on flat content
+}
+
+void main() {
+    uvec2 p = gl_GlobalInvocationID.xy;
+    if (p.x >= pc.width || p.y >= pc.height) return;
+    vec2 fb = (vec2(p) + 0.5) / float(pc.blockSize * pc.flowScale) - 0.5;
+    ivec2 b0 = ivec2(floor(fb));
+    vec2 t = fb - vec2(b0);
+    vec2 v = mix(mix(fetchFlow(b0), fetchFlow(b0 + ivec2(1, 0)), t.x),
+                 mix(fetchFlow(b0 + ivec2(0, 1)), fetchFlow(b0 + ivec2(1, 1)), t.x), t.y);
+    imageStore(motion, ivec2(p), vec4(v * float(pc.flowScale), 0.0, 0.0));
+}

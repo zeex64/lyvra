@@ -1,0 +1,31 @@
+#version 450
+// AMD FidelityFX Super Resolution 1.0 - EASU (edge adaptive spatial upsampling).
+#extension GL_GOOGLE_include_directive : require
+#define A_GPU 1
+#define A_GLSL 1
+#include "ffx_a.h"
+
+layout(local_size_x = 64) in;
+layout(binding = 0) uniform sampler2D inTex;
+layout(rgba8, binding = 1) writeonly uniform image2D outImg;
+layout(push_constant) uniform PC { uvec4 con0, con1, con2, con3; } pc;
+
+#define FSR_EASU_F 1
+AF4 FsrEasuRF(AF2 p) { return textureGather(inTex, p, 0); }
+AF4 FsrEasuGF(AF2 p) { return textureGather(inTex, p, 1); }
+AF4 FsrEasuBF(AF2 p) { return textureGather(inTex, p, 2); }
+#include "ffx_fsr1.h"
+
+void process(AU2 pos) {
+    AF3 c;
+    FsrEasuF(c, pos, pc.con0, pc.con1, pc.con2, pc.con3);
+    imageStore(outImg, ASU2(pos), AF4(c, 1.0));
+}
+
+void main() {
+    AU2 gxy = ARmp8x8(gl_LocalInvocationID.x) + AU2(gl_WorkGroupID.x << 4u, gl_WorkGroupID.y << 4u);
+    process(gxy); gxy.x += 8u;
+    process(gxy); gxy.y += 8u;
+    process(gxy); gxy.x -= 8u;
+    process(gxy);
+}

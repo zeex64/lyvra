@@ -1,0 +1,9 @@
+[submodule "third_party/imgui"]
+	path = third_party/imgui
+	url = https://github.com/ocornut/imgui.git
+[submodule "third_party/vulkan-headers"]
+	path = third_party/vulkan-headers
+	url = https://github.com/KhronosGroup/Vulkan-Headers.git
+[submodule "third_party/fsr1"]
+	path = third_party/fsr1
+	url = https://github.com/GPUOpen-Effects/FidelityFX-FSR.git

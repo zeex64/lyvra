@@ -1,0 +1,14 @@
+#version 450
+// Resamples the frame at a sub-pixel offset so FSR 3 gets varied sample positions
+// (a capture feed has no camera jitter). Sample point for pixel p is p + 0.5 - jitter,
+// matching how FSR expects a jittered projection to sample.
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D src;
+layout(rgba16f, binding = 1) writeonly uniform image2D dst;  // FSR 4 wants a float input
+layout(push_constant) uniform PC { uint width; uint height; float jx; float jy; } pc;
+void main() {
+    uvec2 p = gl_GlobalInvocationID.xy;
+    if (p.x >= pc.width || p.y >= pc.height) return;
+    vec2 uv = (vec2(p) + 0.5 - vec2(pc.jx, pc.jy)) / vec2(pc.width, pc.height);
+    imageStore(dst, ivec2(p), vec4(texture(src, uv).rgb, 1.0));
+}
