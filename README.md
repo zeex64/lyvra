@@ -29,7 +29,7 @@ Measured on a DX20R (1080p120 NV12) with an RX 9070 XT: about 7.7 ms from captur
 
 ## Build
 
-Needs: CMake ≥ 3.20, a C++20 compiler, SDL3, the Vulkan loader, `glslc` (shaderc) and `glslangValidator`. Dear ImGui, FSR 1, the FidelityFX SDK and the Vulkan headers are vendored in `third_party/`. The first build compiles about 250 FidelityFX shader variants (around 7 s on 32 threads).
+Needs: CMake ≥ 3.20, a C++20 compiler, SDL3, the Vulkan loader, `glslc` (shaderc) and `glslangValidator`. Dear ImGui, FSR 1 and the Vulkan headers are git submodules; a trimmed FidelityFX SDK 1.1.4 and the fsr4-vk source are vendored in `third_party/`. The first build compiles about 250 FidelityFX shader variants (around 7 s on 32 threads).
 
 **FSR 4 (optional).** Build fsr4-vk from `third_party/fsr4-vk` by following its README. You need AMD's `amd_fidelityfx_upscaler_dx12.dll` from FidelityFX SDK 2.3.0; its setup verifies the hash and extracts the model, and the result is `build/linux/amd_fidelityfx_upscaler_vk.so`. Then either configure Lyvra with `-DLYVRA_FSR4_VK_LIB=/path/to/amd_fidelityfx_upscaler_vk.so` (copied next to the binary and installed to `lib/lyvra/`), or put the file in `~/.local/share/lyvra/`, or set `LYVRA_FSR4_LIB`. Without it, FSR 4 is greyed out.
 
